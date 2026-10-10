@@ -1,0 +1,23 @@
+{
+  "name": "@blaten/typegpu",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "node tests/run.mjs"
+  },
+  "dependencies": {
+    "blaten": "workspace:*",
+    "tinyest": "0.3.4"
+  },
+  "devDependencies": {
+    "@blaten/compiler": "workspace:*",
+    "typegpu": "0.12.7",
+    "vite": "^8.0.0",
+    "webgpu": "0.6.2"
+  },
+  "peerDependencies": { "typegpu": "~0.12.7" }
+}

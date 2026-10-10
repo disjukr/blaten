@@ -1,0 +1,39 @@
+{
+  "verifiedAt": "2026-10-10T01:11:35.083Z",
+  "dataset": "MNIST (CVDF IDX)",
+  "backend": "typegpu",
+  "typegpuVersion": "0.12.7",
+  "node": "v24.13.0",
+  "platform": "win32",
+  "architecture": "x64",
+  "adapter": {
+    "vendor": "intel",
+    "architecture": "xe-lpg",
+    "device": "intel-r-arc-tm-graphics",
+    "description": "D3D12 driver version 32.0.101.8860"
+  },
+  "trainSize": 12000,
+  "testSize": 2000,
+  "batchSize": 64,
+  "hidden": 32,
+  "learningRate": 0.1,
+  "initialAccuracy": 0.1265,
+  "history": [
+    {
+      "epoch": 1,
+      "loss": 0.6755991045007094,
+      "accuracy": 0.856
+    },
+    {
+      "epoch": 2,
+      "loss": 0.3287048668944262,
+      "accuracy": 0.883
+    },
+    {
+      "epoch": 3,
+      "loss": 0.2790770921158918,
+      "accuracy": 0.8875
+    }
+  ],
+  "seconds": 1.3600486
+}
