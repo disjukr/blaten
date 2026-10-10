@@ -1,6 +1,6 @@
 packages:
   - packages/*
   - examples/*
-onlyBuiltDependencies:
-  - esbuild
-  - webgpu
+allowBuilds:
+  esbuild: true
+  webgpu: true
