@@ -1,7 +1,7 @@
 import tgpu, { type TgpuRoot, type TgpuComputePipeline } from 'typegpu';
 import * as d from 'typegpu/data';
-import { Tensor, type Shape, type DType, type HostStorage, type Scalar } from 'blaten';
-import { lower, signatureOf, topological, sizeOf, isHostStorage, isFloat, makeStorage, type Node, type KernelFunction, type Backend, type Executable, type Program, type CompileOptions, type TensorOrScalar, storageOf, hostData, deviceStorageOf, registerEnvironment } from 'blaten/backend';
+import { Tensor, type TensorTree, type Shape, type DType, type HostStorage, type Scalar } from 'blaten';
+import { lower, signatureOf, topological, sizeOf, isHostStorage, isFloat, makeStorage, type Node, type KernelFunction, type Backend, type Executable, type Program, type CompileOptions, type TensorOrScalar, storageOf, hostData, deviceStorageOf, registerEnvironment, callable, isKernelLeaf, flattenTree, unflattenTree, sameLayout, scope, tensors } from 'blaten/backend';
 import * as ast from './adapter.js';
 const diagnostics = new WeakMap<Executable, { readonly dispatchCount: number; readonly workspaceBytes: number }>();
 export function inspect(executable: Executable) {
@@ -81,7 +81,21 @@ export class TypeGpuBackend implements Backend {
     }, shape, dtype);
     this.tensors.add(result); return result;
   }
-  async copyFrom<S extends Shape, D extends DType>(value: Tensor<S, D>): Promise<Tensor<S, D>> {
+  scope = scope;
+  copyFrom<S extends Shape, D extends DType>(value: Tensor<S, D>): Promise<Tensor<S, D>>;
+  copyFrom<T extends TensorTree>(value: T): Promise<T>;
+  async copyFrom(value: TensorTree): Promise<any> {
+    this.assertAlive();
+    if (!(value instanceof Tensor)) {
+      const { leaves, layout } = tensors(value);
+      const results = await Promise.allSettled(leaves.map(leaf => this.copyFrom(leaf)));
+      const failure = results.find(result => result.status === 'rejected');
+      if (failure?.status === 'rejected') {
+        results.forEach(result => { if (result.status === 'fulfilled') result.value.dispose() });
+        throw failure.reason;
+      }
+      return unflattenTree(layout, results.map(result => (result as PromiseFulfilledResult<Tensor>).value));
+    }
     this.assertAlive(); value.assertAlive();
     this.assertDType(value.dtype);
     if (isHostStorage(storageOf(value))) {
@@ -102,9 +116,9 @@ export class TypeGpuBackend implements Backend {
     this.assertAlive(); value.assertAlive();
     return this.deviceTensor(this.buffer(value.shape, value.dtype, data), value.shape, value.dtype);
   }
-  async compile(fn: KernelFunction, options?: CompileOptions): Promise<Executable> {
+  async compile<T extends KernelFunction>(fn: T, options?: CompileOptions): Promise<Executable<T>> {
     this.assertAlive();
-    return this.compileProgram(lower(fn, signatureOf(fn, options?.inputs)));
+    return this.compileProgram(lower(fn, signatureOf(fn, options?.inputs))) as Executable<T>;
   }
   async synchronize(): Promise<void> {
     this.assertAlive(); await this.root.device.queue.onSubmittedWorkDone();
@@ -135,7 +149,7 @@ export class TypeGpuBackend implements Backend {
       }
     }
     this.directPlans.delete(key); this.directPlans.set(key, executable);
-    return executable.run(...inputs);
+    return executable(...inputs);
   }
   private compileProgram(program: Program): Executable {
     const order = topological(program.outputs);
@@ -240,8 +254,13 @@ export class TypeGpuBackend implements Backend {
       }
     } catch (error) { for (const b of buffers.values()) b.destroy(); throw error }
     let disposed = false;
-    const executable: Executable = {
-      run: (...inputs) => {
+    const executable: Executable = callable((...arguments_) => {
+        let inputs = arguments_;
+        if (program.inputLayout) {
+          const tree = flattenTree(arguments_, isKernelLeaf);
+          if (!sameLayout(tree.layout, program.inputLayout)) throw new Error('Input tree does not match signature');
+          inputs = tree.leaves;
+        }
         this.assertAlive(); if (disposed) throw new Error('Executable is disposed');
         if (inputs.length !== program.inputs.length) throw new Error('Input count does not match signature');
         // Validate all inputs before recording or writing anything.
@@ -274,10 +293,8 @@ export class TypeGpuBackend implements Backend {
           return this.deviceTensor(snapshot, n.shape, n.dtype);
         });
         this.root.device.queue.submit([encoder.finish()]);
-        return program.single ? results[0]! : results;
-      },
-      dispose: () => { if (disposed) return; disposed = true; for (const [node, buffer] of buffers) this.releaseWorkspace(buffer, node.shape, node.dtype); this.executables.delete(executable) },
-    };
+        return program.outputLayout ? unflattenTree(program.outputLayout, results) : program.single ? results[0]! : results;
+      }, () => { if (disposed) return; disposed = true; for (const [node, buffer] of buffers) this.releaseWorkspace(buffer, node.shape, node.dtype); this.executables.delete(executable) });
     diagnostics.set(executable, Object.freeze({ dispatchCount: steps.length, workspaceBytes: [...buffers.keys()].reduce((sum, node) => sum + gpuBytes(sizeOf(node.shape), node.dtype), 0) }));
     this.executables.add(executable); return executable;
   }

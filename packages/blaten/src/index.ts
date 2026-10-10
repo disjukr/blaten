@@ -1,10 +1,14 @@
 export { Tensor, tensor, zeros, ones, randn } from './tensor.js';
+export type { TensorBool, TensorI8, TensorU8, TensorI16, TensorU16, TensorI32, TensorU32, TensorI64, TensorU64, TensorF16, TensorF32, TensorF64 } from './tensor.js';
 export { bool, i8, u8, i16, u16, i32, u32, i64, u64, f16, f32, f64, tensorType } from './types.js';
 export type { Shape, DType, HostStorage, Scalar, ScalarOf, TensorType, ValueType, Signature, SignatureConstraints, ValueConstraint } from './types.js';
 export { grad, valueAndGrad, customJvp, customVjp, kernelIr } from './kernel.js';
 export { add, sub, mul, div, gt, and, or, not, cast, neg, exp, log, tanh, relu, matmul, transpose, reshape, sum, mean, softmax, crossEntropy, map } from './intrinsics.js';
-export { compile } from './runtime.js';
-export type { Backend, Executable, CompileOptions, TensorOrScalar } from './runtime.js';
-export { sgd } from './optimizer.js';
+export { compile, compileLazy } from './runtime.js';
+export type { Backend, Executable, CompileOptions, TensorOrScalar, KernelInput, GradientTree, RuntimeResult } from './runtime.js';
+export { sgd, gradientAccumulator } from './optimizer.js';
 export { getIntrinsic, getIntrinsics } from './intrinsics.js';
 export type { Intrinsic } from './intrinsics.js';
+export { scope } from './scope.js';
+export { disposeTree } from './tree.js';
+export type { TensorTree } from './tree.js';

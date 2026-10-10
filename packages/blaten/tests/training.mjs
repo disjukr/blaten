@@ -1,0 +1,85 @@
+import assert from 'node:assert/strict';
+import { tensor, scope, disposeTree, sgd, gradientAccumulator, compileLazy } from 'blaten';
+import { callable } from 'blaten/backend';
+
+const parameters = { layer: [tensor([10, 20])], bias: tensor([5]) };
+const accumulator = gradientAccumulator(parameters);
+let borrowed;
+scope(() => {
+  borrowed = { bias: tensor([2]), layer: [tensor([1, 3])] };
+  accumulator.add(borrowed, { weight: 2 });
+});
+assert.ok(borrowed.bias.isDisposed);
+scope(() => accumulator.add({ layer: [tensor([7, 9])], bias: tensor([8]) }, { weight: 1 }));
+assert.equal(accumulator.weight, 3);
+const mean = accumulator.mean();
+assert.deepEqual([...await mean.layer[0].read()], [3, 5]);
+assert.deepEqual([...await mean.bias.read()], [4]);
+sgd(parameters, { learningRate: 0.5 }).step(mean);
+assert.deepEqual([...await parameters.layer[0].read()], [8.5, 17.5]);
+assert.deepEqual([...await parameters.bias.read()], [3]);
+disposeTree(mean);
+assert.throws(() => accumulator.add({ layer: [tensor([1])], bias: tensor([1]) }), /matching/);
+assert.equal(accumulator.weight, 3, 'Invalid add must leave accumulator state intact');
+accumulator.clear();
+assert.throws(() => accumulator.mean(), /empty/);
+scope(() => accumulator.add({ layer: [tensor([6, 12])], bias: tensor([3]) }));
+assert.deepEqual([...await scope(() => accumulator.mean().layer[0].read())], [6, 12]);
+accumulator.clear();
+scope(() => accumulator.add({ layer: [tensor([Infinity, NaN])], bias: tensor([Infinity]) }));
+accumulator.clear();
+scope(() => accumulator.add({ layer: [tensor([6, 12])], bias: tensor([3]) }));
+assert.deepEqual([...await scope(() => accumulator.mean().layer[0].read())], [6, 12], 'clear must reset nonfinite values, not multiply them by zero');
+accumulator.dispose(); accumulator.dispose();
+assert.throws(() => accumulator.clear(), /disposed/);
+disposeTree(parameters);
+
+const external = tensor([1]);
+let temporary, childTemporary;
+const kept = scope(() => {
+  temporary = tensor([2]);
+  return scope(() => { childTemporary = tensor([3]); return { kept: tensor([4]), external } });
+});
+assert.ok(temporary.isDisposed && childTemporary.isDisposed);
+assert.ok(!kept.kept.isDisposed && !external.isDisposed);
+disposeTree(kept);
+let failed;
+assert.throws(() => scope(() => { failed = tensor([5]); throw new Error('failure') }), /failure/);
+assert.ok(failed.isDisposed);
+assert.throws(() => scope(async () => tensor([1])), /synchronous callback/);
+let pending, other;
+let resolve, reject;
+const first = scope(() => { pending = tensor([6]); return new Promise(r => { resolve = r }) });
+const second = scope(() => { other = tensor([7]); return new Promise((_, r) => { reject = r }) });
+assert.ok(!pending.isDisposed && !other.isDisposed);
+resolve(42); assert.equal(await first, 42);
+assert.ok(pending.isDisposed && !other.isDisposed, 'Overlapping read scopes must not share ownership');
+reject(new Error('read failed')); await assert.rejects(second, /read failed/);
+assert.ok(other.isDisposed);
+
+let compilations = 0, disposals = 0, failNext = false;
+const backend = { async compile() {
+  compilations++;
+  await Promise.resolve();
+  if (failNext) { failNext = false; throw new Error('compile failure') }
+  let disposed = false;
+  return callable(x => { assert.ok(!disposed); return x.mul(2) }, () => { if (!disposed) { disposed = true; disposals++ } });
+} };
+const fn = compileLazy(x => x, backend, { cacheSize: 1 });
+const x = tensor([1]), y = tensor([2, 3]);
+let result = await fn(x); assert.deepEqual([...await result.read()], [2]); result.dispose();
+result = await fn(x); result.dispose(); assert.equal(compilations, 1);
+const lease = await fn.prepare(x);
+result = await fn(y); result.dispose();
+assert.equal(disposals, 0, 'A prepared plan must survive cache eviction while leased');
+result = lease(x); result.dispose(); lease.dispose(); await Promise.resolve();
+assert.equal(disposals, 1);
+const concurrent = await Promise.all([fn(x), fn(y)]);
+concurrent.forEach(result => result.dispose());
+failNext = true;
+await assert.rejects(fn(tensor([1, 2, 3])), /compile failure/);
+result = await fn(tensor([1, 2, 3])); result.dispose();
+fn.dispose(); await Promise.resolve();
+await assert.rejects(fn(x), /disposed/);
+x.dispose(); y.dispose();
+console.log('Passed: weighted gradient accumulation, resource scopes, concurrent reads, and bounded lazy compilation caching.');

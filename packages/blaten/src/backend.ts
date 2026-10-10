@@ -12,3 +12,8 @@ export type { DeviceStorage } from './tensor.js';
 export { signatureOf } from './kernel.js';
 export { storageOf, hostData, deviceStorageOf } from './tensor.js';
 export { registerEnvironment } from './execution.js';
+
+export { callable, isKernelLeaf } from './runtime.js';
+export { scope } from './scope.js';
+export { flattenTree, unflattenTree, sameLayout } from './tree.js';
+export { tensors } from './tree.js';

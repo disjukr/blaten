@@ -1,4 +1,5 @@
 import { f32, bool, i64, sizeOf, isDType, isHostStorage, storageDType, makeStorage, promoteTypes, scalarDType, type DType, type FloatDType, type Shape, type HostStorage, type Scalar, type ScalarOf } from './types.js';
+import { trackTensor } from './scope.js';
 import * as intrinsics from './intrinsics.js';
 
 export interface DeviceStorage<D extends DType = DType> {
@@ -30,6 +31,18 @@ type NestedOf<S extends Scalar> = S | readonly NestedOf<S>[];
 type ArithmeticResult<D extends DType> = D extends FloatDType ? D : DType;
 type FloatResult<D extends DType> = D extends FloatDType ? D : typeof f32;
 type Transposed<S extends Shape> = S extends readonly [infer A extends number, infer B extends number] ? readonly [B, A] : Shape;
+export type TensorBool<S extends Shape = Shape> = Tensor<S, 'bool'>;
+export type TensorI8<S extends Shape = Shape> = Tensor<S, 'i8'>;
+export type TensorU8<S extends Shape = Shape> = Tensor<S, 'u8'>;
+export type TensorI16<S extends Shape = Shape> = Tensor<S, 'i16'>;
+export type TensorU16<S extends Shape = Shape> = Tensor<S, 'u16'>;
+export type TensorI32<S extends Shape = Shape> = Tensor<S, 'i32'>;
+export type TensorU32<S extends Shape = Shape> = Tensor<S, 'u32'>;
+export type TensorI64<S extends Shape = Shape> = Tensor<S, 'i64'>;
+export type TensorU64<S extends Shape = Shape> = Tensor<S, 'u64'>;
+export type TensorF16<S extends Shape = Shape> = Tensor<S, 'f16'>;
+export type TensorF32<S extends Shape = Shape> = Tensor<S, 'f32'>;
+export type TensorF64<S extends Shape = Shape> = Tensor<S, 'f64'>;
 export class Tensor<S extends Shape = Shape, D extends DType = DType> {
   readonly shape: Readonly<S>;
   readonly strides: readonly number[];
@@ -49,6 +62,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
     if (isHostStorage(storage) && storageDType(storage) !== (dtype === bool ? 'u8' : dtype)) throw new Error('Storage array does not match tensor dtype');
     if (dtype === bool && isHostStorage(storage) && Array.from(storage as any).some(value => value !== 0 && value !== 1)) throw new Error('bool storage must contain only 0 or 1');
     storages.set(this, storage);
+    trackTensor(this);
   }
   get rank(): S['length'] { return this.shape.length }
   get isDisposed() { return this.disposed }

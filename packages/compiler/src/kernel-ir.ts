@@ -21,6 +21,16 @@ export function toKernelIR(fn: any, externals: ReadonlySet<string>): KernelIR {
       }
       case 'NumericLiteral': case 'BooleanLiteral': case 'StringLiteral': return emit({ op: 'literal', value: node.value });
       case 'BigIntLiteral': return emit({ op: 'bigint', value: node.value });
+      case 'ObjectExpression': {
+        const fields: Record<string, number> = {};
+        for (const property of node.properties) {
+          if (property.type !== 'ObjectProperty' || property.computed || property.method) throw new Error('Kernel objects require fixed properties');
+          const key = property.key.name ?? property.key.value;
+          if (key === '__proto__') throw new Error('Unsupported kernel object key');
+          fields[key] = expression(property.value);
+        }
+        return emit({ op: 'object', fields });
+      }
       case 'ArrayExpression': return emit({ op: 'array', values: node.elements.map(expression) });
       case 'BinaryExpression': {
         const operators = { '+': 'add', '-': 'sub', '*': 'mul', '/': 'div', '**': 'pow', '>': 'gt' } as const;

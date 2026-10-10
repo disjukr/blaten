@@ -4,13 +4,18 @@ import { stripTypeScriptTypes } from 'node:module';
 import plugin from '@blaten/compiler';
 import { definitionOf, registerKernel, kernelIr } from 'blaten/internal';
 import { lower, signatureOf, topological } from 'blaten/backend';
-import { compile, tensor, f32, f64, grad, tensorType, kernelIr as publicKernelIr } from 'blaten';
+import { compile, tensor, f32, f64, grad, valueAndGrad, tensorType, kernelIr as publicKernelIr } from 'blaten';
 
 const compiler = plugin();
 const source = `
 import { reshape, zeros, tensor, f32, bool, type Tensor as T } from 'blaten';
 import type { Image as ImportedImage } from './fixtures/types.js';
 type Image = T<readonly [2, 3], typeof f32>;
+type Weights = { layer: readonly [Image]; bias: Image };
+export function structured(p: Weights, x: Image) { 'use kernel'; return { prediction: x.add(p.layer[0]).add(p.bias), weights: p } }
+export function structuredLoss(p: Weights) { 'use kernel'; return p.layer[0].mul(p.layer[0]).sum().add(p.bias.sum()) }
+type Recursive = { child: Recursive };
+export function recursive(p: Recursive) { 'use kernel'; return p }
 export function concrete(x: Image) { 'use kernel'; return shaped(x) }
 export function imported(x: ImportedImage) { 'use kernel'; return shaped(x) }
 export const concreteArrow = (x: Image) => { 'use kernel'; return shaped(x) };
@@ -120,7 +125,7 @@ for (const fn of [module.imported, module.concreteArrow, module.concreteExpressi
 assert.deepEqual(signatureOf(module.mask), { inputs: [tensorType([2], 'bool')] });
 assert.deepEqual(signatureOf(grad(grad(module.concrete))), signatureOf(module.concrete));
 for (const fn of [module.dynamic, module.ambiguous, module.optional, module.implicit, module.generic, module.optionalShape, module.restShape, manual]) assert.throws(() => signatureOf(fn), /Cannot compile/);
-const backend = { async compile(fn) { const program = lower(fn, signatureOf(fn)); return { dispatchCount: 1, program, run() {}, dispose() {} } } };
+const backend = { async compile(fn) { const program = lower(fn, signatureOf(fn)); return Object.assign(() => {}, { dispatchCount: 1, program, dispose() {} }) } };
 assert.deepEqual((await compile(module.concrete, backend)).program.inputs[0].shape, [2, 3]);
 await assert.rejects(compile(module.dynamic, backend), /Cannot compile/);
 const example = tensor([[1, 2, 3], [4, 5, 6]]);
@@ -136,3 +141,18 @@ assert.throws(() => signatureOf(module.dynamic, [destroyed]), /disposed/);
 const inputBackend = { ...backend, async compile(fn, options) { return { program: lower(fn, signatureOf(fn, options?.inputs)) } } };
 assert.deepEqual((await compile(module.dynamic, inputBackend, { inputs: [example] })).program.inputs[0].shape, [2, 3]);
 console.log('Passed: type-derived signatures, wrapper specialization, runtime signature errors, AST-to-IR build boundary, shape specialization, external references, helpers, direct IR registration, and build-time syntax validation.');
+
+const weights = { layer: [example], bias: example };
+const structuredSignature = signatureOf(module.structured, [weights, example]);
+const structuredProgram = lower(module.structured, structuredSignature);
+assert.equal(structuredProgram.inputs.length, 3);
+assert.equal(structuredProgram.outputs.length, 3);
+assert.equal(structuredProgram.outputLayout.kind, 'record');
+const differentiated = lower(valueAndGrad(module.structuredLoss), signatureOf(module.structuredLoss, [weights]));
+assert.equal(differentiated.outputs.length, 3);
+assert.equal(differentiated.outputLayout.fields.grads.kind, 'record');
+assert.throws(() => signatureOf(module.structuredLoss, [{ ...weights, extra: example }]), /record fields/);
+assert.throws(() => signatureOf(module.structuredLoss, [{ ...weights, layer: [] }]), /fixed tuple/);
+assert.throws(() => signatureOf(module.structuredLoss, [{ ...weights, bias: tensor([1]) }]), /expected shape/);
+assert.throws(() => signatureOf(module.recursive), /Cannot compile/);
+console.log('Passed: nested parameter signatures, structured results and gradients, and tree validation.');

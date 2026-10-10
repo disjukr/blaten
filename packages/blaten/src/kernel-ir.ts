@@ -11,6 +11,7 @@ export type KernelInstruction =
   | { readonly op: 'literal'; readonly value: number | boolean | string }
   | { readonly op: 'bigint'; readonly value: string }
   | { readonly op: 'array'; readonly values: readonly number[] }
+  | { readonly op: 'object'; readonly fields: Readonly<Record<string, number>> }
   | { readonly op: 'binary'; readonly operator: 'add' | 'sub' | 'mul' | 'div' | 'pow' | 'gt'; readonly left: number; readonly right: number }
   | { readonly op: 'neg'; readonly value: number }
   | { readonly op: 'member'; readonly object: number; readonly key: number }

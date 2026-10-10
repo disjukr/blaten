@@ -31,7 +31,7 @@ pnpm lint
 pnpm mnist
 ```
 
-MNIST downloads the [CVDF IDX files](https://storage.googleapis.com/cvdf-datasets/mnist/) on first use and caches them in `examples/mnist/data/`. Defaults are 12,000 training images, 2,000 separate test images, batch size 64, and three epochs. Use `TRAIN_SIZE=60000` and `TEST_SIZE=10000` for the full dataset. `EPOCHS` and `LEARNING_RATE` are also configurable through environment variables.
+MNIST downloads the [CVDF IDX files](https://storage.googleapis.com/cvdf-datasets/mnist/) on first use and caches them in `examples/mnist/data/`. Defaults are 12,000 training images, 2,000 separate test images, batch size 64, and three epochs. Use `TRAIN_SIZE=60000` and `TEST_SIZE=10000` for the full dataset. `EPOCHS` and `LEARNING_RATE` are also configurable through environment variables. `ACCUMULATION_STEPS` defaults to 1; set it to 4 to average four batches on the GPU before each update. The final accumulation window is flushed at the end of each epoch.
 
 The model's `Images` and `Labels` types leave the batch dimension as `number`. Compilation specializes them from example inputs; set `BATCH_SIZE` to change the batch size without editing model wrappers. `model.ts` sets `hiddenSize = 32`. Results are written to `examples/mnist/results/latest.json`.
 
@@ -61,12 +61,12 @@ function squaredSum(x: Tensor<[number], typeof f32>) {
 const backend = await typegpu();
 const input = tensor([1, 2, 3]);
 const program = await compile(squaredSum, backend, { inputs: [input] });
-const result = program.run(input) as Tensor<Shape, typeof f32>;
+const result = program(input);
 console.log(await result.item()); // 14
 console.log(inspect(program).dispatchCount); // 1: multiply and sum share a shader
 
 const derivative = await compile(grad(squaredSum), backend, { inputs: [input] });
-const gradient = derivative.run(input) as Tensor<Shape, typeof f32>;
+const gradient = derivative(input);
 console.log(await gradient.read()); // Float32Array [2, 4, 6]
 
 result.dispose();
@@ -91,11 +91,11 @@ device.destroy(); // The caller owns externally supplied devices.
 
 Calling a kernel directly executes its ordinary JavaScript body. Tensor operations execute in their inputs' environment: host tensors use the CPU reference implementation, while GPU tensors submit GPU operations. Direct calls execute operation by operation; `compile()` uses kernel IR to fuse operations across the function. Mixing host and device tensors, or tensors belonging to different backends, requires an explicit `await destination.copyFrom(source)` first. JS scalars can be used with tensors in either environment.
 
-`run()` submits GPU commands and immediately returns GPU-backed tensors; it does not wait for computation to finish. `read()` and `item()` asynchronously wait for the data and copy it to the CPU. Outputs have independent storage, so later executions do not overwrite them. Dispose them when no longer needed.
+Calling an executable submits GPU commands and immediately returns GPU-backed tensors; it does not wait for computation to finish. `read()` and `item()` asynchronously wait for the data and copy it to the CPU. Outputs have independent storage, so later executions do not overwrite them. Dispose them when no longer needed.
 
 Executables lease reusable input, intermediate, and constant buffers. `program.dispose()` returns these buffers to the backend's pool. TypeGPU retains up to 64 MiB of free workspace and up to 32 cached plans for direct operations. Result tensors have independent storage. Disposing the backend also disposes its executables, GPU tensors, and pooled resources.
 
-The common backend exposes `capabilities.dtypes`, `copyFrom()`, `compile()`, `synchronize()`, and `dispose()`. `await backend.synchronize()` waits for submitted work without reading a tensor. Backend-specific diagnostics live in `@blaten/typegpu`: `inspect(program)` reports `dispatchCount` and leased `workspaceBytes`. Dispatch count measures compute dispatches per execution, not queue submissions or elapsed time. One compiled function can submit several dispatches together.
+The common backend exposes `capabilities.dtypes`, `copyFrom()`, `compile()`, `scope()`, `synchronize()`, and `dispose()`. `await backend.synchronize()` waits for submitted work without reading a tensor. Backend-specific diagnostics live in `@blaten/typegpu`: `inspect(program)` reports `dispatchCount` and leased `workspaceBytes`. Dispatch count measures compute dispatches per execution, not queue submissions or elapsed time. One compiled function can submit several dispatches together.
 
 `tensor([[1, 2], [3, 4]])` infers its shape. For TypedArrays, use `tensor(values, { shape: [2, 2] })` to specify a shape. `zeros(shape)`, `ones(shape)`, and `randn(shape, { seed, scale })` are also available.
 
@@ -134,7 +134,7 @@ Bool arithmetic requires an explicit numeric cast; and/or/not accept only bool i
 
 ## Differentiation
 
-`grad(fn, { arg: 0 })` and `valueAndGrad(fn, { arg: [2, 3] })` construct derivative definitions without executing the function. The original function must return a scalar-shaped value (`[]`). Derivatives can be nested, as in `grad(grad(fn))`. Gradients for multiple arguments are returned as an array; `valueAndGrad` returns `[value, ...gradients]`.
+`grad(fn, { arg: 0 })` and `valueAndGrad(fn, { arg: [2, 3] })` construct derivative definitions without executing the function. The original function must return a scalar-shaped value (`[]`). Derivatives can be nested, as in `grad(grad(fn))`. The default differentiation target is the first argument. Targets may be tensors, fixed tuples, or nested plain records; gradients preserve that structure. Multiple selected arguments produce an array of gradient trees (a single selected argument produces its gradient tree). `valueAndGrad` returns `{ value, grads }`; this replaces the earlier `[value, ...gradients]` result. Tensor objects do not carry gradient state.
 
 A custom VJP receives the original inputs followed by the output cotangent, and returns one gradient per input. Rules are kernels too, so differentiating the rules supports higher derivatives.
 
@@ -157,7 +157,7 @@ const withJvp = customJvp(square, { jvp: tangent });
 
 JVP arguments are `(...inputs, ...inputTangents)`. Its output must match the original output shape. The implementation conservatively checks homogeneous linearity in the tangent, then transposes that linear map for reverse-mode differentiation. Generated derivatives must be compiled before execution.
 
-Keep training parameters on the GPU with `await backend.copyFrom(tensor)`. `copyFrom` preserves shape and dtype and always returns independent storage owned by the destination backend, leaving the source intact. Host inputs are copied to the device; copies within the same backend stay on the GPU. Other backends currently use a host snapshot as an intermediate. The Promise resolves after copying has been submitted, without waiting for GPU completion; `read()` or `item()` waits when host values are needed.
+Keep training parameters on the GPU with `await backend.copyFrom(tensorOrTree)`. Fixed arrays and nested plain records of tensors are copied with their structure intact. `copyFrom` preserves shape and dtype and always returns independent storage owned by the destination backend, leaving the source intact. Host inputs are copied to the device; copies within the same backend stay on the GPU. Other backends currently use a host snapshot as an intermediate. The Promise resolves after copying has been submitted, without waiting for GPU completion; `read()` or `item()` waits when host values are needed.
 
 SGD belongs to the common runtime and uses tensor IR in the parameters' environment:
 
@@ -167,15 +167,59 @@ const optimizer = sgd(parameters, { learningRate: 0.1 });
 optimizer.step(gradients);
 ```
 
-Parameters and gradients must share an environment, shape, and floating dtype. Updates mutate parameter storage without reading GPU gradients on the CPU. The MNIST example normalizes data and prepares batches on the CPU, performs forward/backward computation and parameter updates on the GPU, and reads scalar loss for logging.
+Parameters and gradients must have matching tree structure, environment, shapes, and floating dtypes. Record key insertion order does not matter. Parameter tensors must be distinct. Updates mutate parameter storage without reading GPU gradients on the CPU. The MNIST example normalizes data and prepares batches on the CPU, performs forward/backward computation and parameter updates on the GPU, and accumulates scalar loss on the GPU. Training batches submit work without a host read; epoch reporting reads average loss once. Evaluation submits every inference/readback before awaiting their results together.
+
+## Training and tensor lifetimes
+
+Put parameters in the first argument of a kernel and compile its value and gradient together:
+
+```ts
+type Parameters = { weights: Tensor<[784, 10], typeof f32>; bias: Tensor<[10], typeof f32> };
+function loss(p: Parameters, x: Tensor<[number, 784], typeof f32>, y: Tensor<[number, 10], typeof f32>) {
+  'use kernel';
+  return crossEntropy(x.matmul(p.weights).add(p.bias), y);
+}
+const parameters = await backend.copyFrom(initialParameters);
+const training = await backend.compile(valueAndGrad(loss), { inputs: [parameters, sampleX, sampleY] });
+const optimizer = sgd(parameters, { learningRate: 0.1 });
+
+const lossValue = await backend.scope(() => {
+  const [x, y] = batch.toTensors();
+  const { value, grads } = training(parameters, x, y);
+  optimizer.step(grads);
+  return value.item();
+});
+```
+
+`scope()` tracks tensors created synchronously inside its callback, including CPU batch tensors and GPU operation results. It releases temporaries on normal return or exception. Returned tensors, including tensors inside arrays or records, escape to the caller (or an enclosing scope); borrowed input tensors are untouched. A synchronous callback can return a read Promise: cleanup waits for it to settle, including rejection. Async callbacks are rejected; allocations after an `await` or inside a Promise continuation are not part of the scope. This keeps allocation ownership local without a Node-specific async context. `scope()` is also exported directly by `blaten`, and `disposeTree()` releases an explicitly owned tensor tree.
+
+For accumulation, keep an accumulator outside the batch scope:
+
+```ts
+const accumulator = gradientAccumulator(parameters);
+backend.scope(() => {
+  const { grads } = training(parameters, x, y);
+  accumulator.add(grads, { weight: sampleCount });
+});
+// Repeat add() for more batches before updating parameters.
+backend.scope(() => {
+  optimizer.step(accumulator.mean());
+  accumulator.clear();
+});
+accumulator.dispose();
+```
+
+`add()` borrows gradients and maintains independent persistent buffers in their environment. On GPU parameters, weighting, addition, averaging, clearing, and SGD stay on the GPU. `weight` is a positive finite number (default 1); use the actual sample count for batches whose loss is a per-sample mean. `mean()` returns independently owned tensors and rejects an empty accumulator. `clear()` resets the weight and reuses accumulation buffers; `dispose()` releases them. Flush a final partial accumulation window using its actual weight.
 
 ## Function types and compilation
 
-Shape is the first type parameter: `Tensor<S = Shape, D = DType>`. You can write `Tensor<[2, 3], typeof f32>` without `readonly`; the shape property is `Readonly<S>` and is frozen at runtime. The rank type is `S['length']`. Creation functions default to f32 for numeric data, while an unspecified dtype in the Tensor type means DType.
+Shape is the first type parameter: `Tensor<S = Shape, D = DType>`. You can write `Tensor<[2, 3], typeof f32>` without `readonly`; the shape property is `Readonly<S>` and is frozen at runtime. Public dtype aliases are `TensorBool`, `TensorI8`, `TensorU8`, `TensorI16`, `TensorU16`, `TensorI32`, `TensorU32`, `TensorI64`, `TensorU64`, `TensorF16`, `TensorF32`, and `TensorF64`. Each accepts `S extends Shape = Shape` and fixes the corresponding dtype: use `TensorF32<[2, 3]>` for a known shape or `TensorF32` for an arbitrary shape. These aliases have no runtime cost. The rank type is `S['length']`. Creation functions default to f32 for numeric data, while an unspecified dtype in the Tensor type means DType.
 
-The build plugin extracts input signatures from TypeScript parameter types, resolving imported aliases and `typeof` dtype constants. Numbers lower to f32, booleans to bool, and bigints to i64. Tensor inputs need fixed shape tuples and a single concrete dtype to compile directly.
+The build plugin extracts input signatures from TypeScript parameter types, resolving imported aliases and `typeof` dtype constants. Numbers lower to f32, booleans to bool, and bigints to i64. Tensor inputs need fixed shape tuples and a single concrete dtype to compile directly. Fixed tuples and records of these input types are supported recursively; optional fields, sparse arrays, class instances, and recursive record types are not supported. Kernels can access fixed record fields and return nested tensor records or arrays.
 
-`compile(fn, backend)` uses a concrete extracted signature. For unknown dimensions or dtype unions, use `compile(fn, backend, { inputs: [...] })`. Compilation derives actual shapes and dtypes and validates them against declared constraints, including fixed dimensions. Untyped or unsupported parameter types still produce a runtime error. Example inputs supply types; their tensor values are not captured. Output shapes and dtypes are inferred from tensor IR; return-type annotations are not enforced as output constraints.
+`compile(fn, backend)` uses a concrete extracted signature. For unknown dimensions or dtype unions, use `compile(fn, backend, { inputs: [...] })`. Compilation derives actual shapes and dtypes and validates them against declared constraints, including fixed dimensions. Untyped or unsupported parameter types still produce a runtime error. Example inputs supply types; their tensor values are not captured. Output shapes and dtypes are inferred from tensor IR; return-type annotations are not enforced as output constraints. Input and result types are preserved by the callable executable, so ordinary application calls do not need result casts.
+
+`compileLazy(fn, backend, { cacheSize: 8 })` provides lazy asynchronous calls. It specializes on the first call for each tree layout, shape, and dtype and maintains an LRU cache (default eight plans); scalar values are runtime inputs, not cache keys. Use `await lazy(...inputs)` for dynamic signatures, and dispose returned tensors explicitly. For scoped synchronous execution, `const program = await lazy.prepare(...exampleInputs)` returns a callable lease; use it inside `scope()` and call `program.dispose()` afterwards. Prepared leases remain valid across cache eviction. `lazy.dispose()` invalidates calls and releases cached plans once active leases finish. Compilation failures are not cached. Explicit `compile()` remains available when startup preparation is preferable.
 
 ```ts
 function genericSum(x: Tensor) {
@@ -211,7 +255,7 @@ Application functions are not registered with TypeGPU. Only generated compute fu
 
 Kernel definitions are stored on their function objects under `Symbol.for('blaten.kernel')`, exported as `kernelIr` by `blaten` and `blaten/internal`. `registerKernel()` attaches ordinary kernels; grad, valueAndGrad, customVjp, and customJvp attach definitions to their generated functions using the same symbol. The property is non-enumerable, non-writable, and non-configurable. Different copies of the runtime in the same JavaScript realm can read it. `definitionOf()` reads only own properties and validates the IR version. Ordinary kernel IR is available at `definitionOf(fn).metadata.ir`. Binding a function or wrapping it arbitrarily does not copy its definition.
 
-`blaten/ir` exposes kernel IR types: a linear value graph of parameters, external references, literals, arrays, arithmetic, member access, and calls. Local variables and TS syntax disappear during the build. Helpers and map callbacks remain function references. Shape reads and external values resolve during runtime lowering. Concretely typed wrappers specialize generic helpers. The build plugin validates source syntax; runtime lowering validates shapes, operations, and call targets.
+`blaten/ir` exposes kernel IR types: a linear value graph of parameters, external references, literals, arrays, records, arithmetic, member access, and calls. Local variables and TS syntax disappear during the build. Helpers and map callbacks remain function references. Shape reads and external values resolve during runtime lowering. Concretely typed wrappers specialize generic helpers. The build plugin validates source syntax; runtime lowering validates shapes, operations, and call targets.
 
 The core's [lowering.ts](packages/blaten/src/lowering.ts) specializes kernel IR into tensor IR. Legacy AST metadata v1 is not accepted; update and rebuild compiler and runtime together. `compile(fn, backend)` delegates to the backend's compile method. Future native/WASM backends can use the same [runtime interface](packages/blaten/src/runtime.ts).
 

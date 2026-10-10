@@ -61,7 +61,7 @@ const rule: Rule.RuleModule = {
     }
     function inspect(node: any) {
       if (node.async || node.generator || node.params.some((p: any) => p.type !== 'Identifier')) context.report({ node, messageId: 'unsupported', data: { syntax: 'async, generator, or non-identifier parameters' } });
-      const allowed = new Set(['BlockStatement', 'ExpressionStatement', 'Literal', 'Identifier', 'ReturnStatement', 'VariableDeclaration', 'VariableDeclarator', 'BinaryExpression', 'UnaryExpression', 'ArrayExpression', 'CallExpression', 'MemberExpression']);
+      const allowed = new Set(['BlockStatement', 'ExpressionStatement', 'Literal', 'Identifier', 'ReturnStatement', 'VariableDeclaration', 'VariableDeclarator', 'BinaryExpression', 'UnaryExpression', 'ArrayExpression', 'ObjectExpression', 'Property', 'CallExpression', 'MemberExpression']);
       const visit = (n: any) => {
         if (!n || typeof n !== 'object') return;
         if (n.type?.startsWith('TS')) {
@@ -75,6 +75,7 @@ const rule: Rule.RuleModule = {
         }
         if (n.type === 'VariableDeclaration' && n.kind !== 'const') context.report({ node: n, messageId: 'unsupported', data: { syntax: n.kind } });
         if (n.type === 'VariableDeclarator' && (n.id.type !== 'Identifier' || !n.init)) context.report({ node: n, messageId: 'unsupported', data: { syntax: 'destructured or uninitialized binding' } });
+        if (n.type === 'Property' && (n.computed || n.method || n.kind !== 'init')) context.report({ node: n, messageId: 'unsupported', data: { syntax: 'computed property, method, or accessor' } });
         if (n.type === 'BinaryExpression' && !['+', '-', '*', '/', '**', '>'].includes(n.operator)) context.report({ node: n, messageId: 'unsupported', data: { syntax: n.operator } });
         if (n.type === 'UnaryExpression' && n.operator !== '-') context.report({ node: n, messageId: 'unsupported', data: { syntax: n.operator } });
         if (n.type === 'CallExpression') {

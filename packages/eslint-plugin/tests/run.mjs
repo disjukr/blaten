@@ -29,6 +29,9 @@ for (const op of intrinsics) {
   assert.equal(method.errorCount, op.tensorMethod ? 0 : 1, `${op.name} method: ${JSON.stringify(method.messages)}`);
 }
 for (const [source, expected] of [
+  [`function f(p: any) { 'use kernel'; return { weights: [p.weights], bias: p.bias } }`, 0],
+  [`function f(p: any) { 'use kernel'; return { [p.name]: p.bias } }`, 1],
+  [`function f(p: any) { 'use kernel'; return { ...p } }`, 1],
   [`import { sum, map as each, type Tensor } from 'blaten'; import { square } from './helper.js'; function f(x: Tensor) { 'use kernel'; return sum(each(square, x)) }`, 0],
   [`function f(x: number) { return x * 2 } function g(x: number) { 'use kernel'; return f(x) }`, 1],
   [`import { map as each } from 'blaten'; function f(x: number) { return x*x } function g(x: any) { 'use kernel'; return each(f,x) }`, 1],

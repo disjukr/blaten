@@ -32,7 +32,9 @@ export function signatureReader(source: string, id: string): (start: number) => 
     ts.forEachChild(node, visit);
   };
   visit(file);
-  function valueType(type: ts.Type, at: ts.Node): ValueConstraint {
+  function valueType(type: ts.Type, at: ts.Node, ancestors = new Set<ts.Type>()): ValueConstraint {
+    if (ancestors.has(type)) throw new Error('Kernel input types cannot contain recursive records');
+    ancestors = new Set([...ancestors, type]);
     const shapeProperty = type.getProperty('shape'), dtypeProperty = type.getProperty('dtype');
     if (shapeProperty && dtypeProperty) {
       const shapeType = checker.getTypeOfSymbolAtLocation(shapeProperty, at);
@@ -63,6 +65,21 @@ export function signatureReader(source: string, id: string): (start: number) => 
     if (type.flags & ts.TypeFlags.NumberLike) return 'f32';
     if (type.flags & ts.TypeFlags.BigIntLike) return 'i64';
     if (type.flags & ts.TypeFlags.BooleanLike || type.isUnion() && type.types.every(part => !!(part.flags & ts.TypeFlags.BooleanLike))) return 'bool';
+    if (checker.isTupleType(type)) {
+      const target = (type as ts.TupleTypeReference).target;
+      if (target.elementFlags.some(flag => flag !== ts.ElementFlags.Required)) throw new Error('Kernel tuples require fixed required elements');
+      return { kind: 'tuple', items: checker.getTypeArguments(type as ts.TypeReference).map(child => valueType(child, at, ancestors)) };
+    }
+    if (type.flags & ts.TypeFlags.Object && !checker.isArrayType(type) && !type.getCallSignatures().length) {
+      const properties = type.getProperties();
+      if (!properties.length || checker.getIndexInfosOfType(type).length) throw new Error('Kernel records require named tensor/scalar fields');
+      const fields: Record<string, ValueConstraint> = {};
+      for (const property of properties.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (property.flags & ts.SymbolFlags.Optional || property.name === '__proto__') throw new Error('Kernel records require fixed required fields');
+        fields[property.name] = valueType(checker.getTypeOfSymbolAtLocation(property, at), at, ancestors);
+      }
+      return { kind: 'record', fields };
+    }
     throw new Error(`Unsupported input type ${checker.typeToString(type)}`);
   }
   return start => {
@@ -74,10 +91,16 @@ export function signatureReader(source: string, id: string): (start: number) => 
         return valueType(checker.getTypeAtLocation(parameter), parameter);
       });
       const constraints = { inputs };
-      if (inputs.some(input => typeof input !== 'string' && (input.shape === null || input.shape.includes(null) || input.dtypes.length !== 1))) {
-        return { constraints, signatureError: 'Input shape or dtype is not concrete; supply compile options.inputs' };
-      }
-      return { constraints, signature: { inputs: inputs.map(input => typeof input === 'string' ? input : ({ kind: 'tensor', shape: input.shape as number[], dtype: input.dtypes[0]! })) } };
+      const concrete = (input: ValueConstraint): import('blaten').ValueType => {
+        if (typeof input === 'string') return input;
+        if (input.kind === 'tuple') return { kind: 'tuple', items: input.items.map(concrete) };
+        if (input.kind === 'record') return { kind: 'record', fields: Object.fromEntries(Object.entries(input.fields).map(([key, value]) => [key, concrete(value)])) };
+        if (input.shape === null || input.shape.includes(null) || input.dtypes.length !== 1) throw new Error('Input shape or dtype is not concrete; supply compile options.inputs');
+        return { kind: 'tensor', shape: input.shape as number[], dtype: input.dtypes[0]! };
+      };
+      try { return { constraints, signature: { inputs: inputs.map(concrete) } } }
+      catch (error) { return { constraints, signatureError: (error as Error).message } }
+
     } catch (error) {
       return { signatureError: (error as Error).message };
     }

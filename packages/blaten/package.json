@@ -13,6 +13,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node tests/dtypes.mjs"
+    "test": "node tests/dtypes.mjs && node tests/training.mjs"
   }
 }

@@ -4,10 +4,12 @@ import { Tensor, hostData } from './tensor.js';
 import { getIntrinsic, toNode, type Intrinsic } from './intrinsics.js';
 import * as ir from './ir.js';
 import { shapeOf, dtypeOf, isFloat, type Signature } from './types.js';
+import { flattenTree, unflattenTree, sameLayout, type TreeLayout } from './tree.js';
 
-export interface Program { inputs: ir.Node[]; outputs: ir.Node[]; single: boolean }
+export interface Program { inputs: ir.Node[]; outputs: ir.Node[]; single: boolean; inputLayout?: TreeLayout; outputLayout?: TreeLayout }
 const isExpression = (x: unknown): x is ir.Expression => x instanceof ir.Expression;
 const asNode = (x: any) => toNode(x);
+const isValue = (x: unknown): x is ir.Expression | number | boolean | bigint => isExpression(x) || ['number', 'boolean', 'bigint'].includes(typeof x);
 const boxed = (x: ir.Node) => new ir.Expression(x);
 // Method references carry their receiver locally, without registering temporary functions.
 class IntrinsicMethod {
@@ -15,34 +17,51 @@ class IntrinsicMethod {
 }
 // Specialize the kernel value graph into shape-resolved tensor IR.
 export function lower(fn: KernelFunction, signature: Signature): Program {
-  const inputs = signature.inputs.map((type, index) => ir.node('input', [], shapeOf(type), { index }, dtypeOf(type)));
-  const value = invoke(fn, inputs.map(boxed), []);
-  const outputs = (Array.isArray(value) ? value.flat(Infinity) : [value]).map(asNode);
+  const inputs: ir.Node[] = [];
+  const argument = (type: Signature['inputs'][number]): any => {
+    if (typeof type !== 'string' && type.kind === 'tuple') return type.items.map(argument);
+    if (typeof type !== 'string' && type.kind === 'record') return Object.fromEntries(Object.keys(type.fields).sort().map(key => [key, argument(type.fields[key]!)]));
+    const input = ir.node('input', [], shapeOf(type), { index: inputs.length }, dtypeOf(type));
+    inputs.push(input); return boxed(input);
+  };
+  const args = signature.inputs.map(argument);
+  const inputLayout = flattenTree(args, isExpression).layout;
+  const value = invoke(fn, args, []);
+  const result = flattenTree(value, isValue);
+  const outputs = result.leaves.map(asNode);
   if (signature.output) {
-    const types = typeof signature.output === 'string' || !Array.isArray(signature.output) ? [signature.output] : signature.output;
-    if (types.length !== outputs.length || types.some((type, i) => String(shapeOf(type as any)) !== String(outputs[i]!.shape) || dtypeOf(type as any) !== outputs[i]!.dtype)) throw new Error('Output signature does not match inferred shape or dtype');
+    const expand = (type: Signature['inputs'][number]): any => typeof type === 'string' || type.kind === 'tensor' ? type : type.kind === 'tuple' ? type.items.map(expand) : Object.fromEntries(Object.keys(type.fields).sort().map(key => [key, expand(type.fields[key]!)]));
+    const expected = Array.isArray(signature.output) ? signature.output.map(expand) : expand(signature.output as Signature['inputs'][number]);
+    const types = flattenTree(expected, (x): x is import('./types.js').ValueType => typeof x === 'string' || !!x && typeof x === 'object' && 'kind' in x && x.kind === 'tensor');
+    if (!sameLayout(types.layout, result.layout) || types.leaves.length !== outputs.length || types.leaves.some((type, i) => String(shapeOf(type)) !== String(outputs[i]!.shape) || dtypeOf(type) !== outputs[i]!.dtype)) throw new Error('Output signature does not match inferred shape or dtype');
   }
-  return { inputs, outputs, single: !Array.isArray(value) };
+  return { inputs, outputs, single: result.layout.kind === 'leaf', inputLayout, outputLayout: result.layout };
 }
 function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[]): any {
   if (stack.includes(fn)) throw new Error('Recursive kernels are not supported');
   const definition = definitionOf(fn);
   if (definition.kind === 'grad') {
     const output = invoke(definition.source, args, stack);
-    if (Array.isArray(output) || asNode(output).shape.length !== 0) throw new Error('grad requires a scalar output; use a reduction');
-    const targets = definition.args.map(i => { if (i >= args.length) throw new Error('Gradient argument out of range'); return asNode(args[i]) });
+    if ((!isExpression(output) && typeof output === 'object') || asNode(output).shape.length !== 0) throw new Error('grad requires a scalar output; use a reduction');
+    const selected = definition.args.map(i => { if (i >= args.length) throw new Error('Gradient argument out of range'); return args[i] });
+    const targetTree = flattenTree(selected, isValue);
+    const targets = targetTree.leaves.map(asNode);
+    if (!targets.length) throw new Error('Gradient targets cannot be an empty tree');
     const gradients = ir.vjp(asNode(output), targets).map(boxed);
-    const result = gradients.length === 1 ? gradients[0] : gradients;
-    return definition.value ? [output, ...gradients] : result;
+    const structured = unflattenTree(targetTree.layout, gradients);
+    const result = selected.length === 1 ? structured[0] : structured;
+    return definition.value ? { value: output, grads: result } : result;
   }
   if (definition.kind === 'vjp') {
     const forward = asNode(invoke(definition.source, args, stack));
-    const n = ir.node('custom', args.map(asNode), forward.shape, {
+    const tree = flattenTree(args, isValue);
+    const n = ir.node('custom', tree.leaves.map(asNode), forward.shape, {
       forward,
       backward: (seed: ir.Node) => {
         const gradients = invoke(definition.backward, [...args, boxed(seed)], stack);
-        if (!Array.isArray(gradients)) throw new Error('customVjp backward must return an array');
-        return gradients.map(asNode);
+        const result = flattenTree(gradients, isValue);
+        if (!sameLayout(tree.layout, result.layout)) throw new Error('customVjp backward must return an array matching the input trees');
+        return result.leaves.map(asNode);
       },
     }, forward.dtype);
     return boxed(n);
@@ -50,11 +69,13 @@ function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[]): any {
   if (definition.kind === 'jvp') {
     const forward = asNode(invoke(definition.source, args, stack));
     // Transpose the linear tangent map using the same reverse-mode IR transform.
-    const tangents = args.map((a, i) => ir.node('input', [], asNode(a).shape, { tangent: i }, asNode(a).dtype));
-    const tangentOutput = asNode(invoke(definition.jvp, [...args, ...tangents.map(boxed)], stack));
+    const tree = flattenTree(args, isValue);
+    const tangents = tree.leaves.map((a, i) => ir.node('input', [], asNode(a).shape, { tangent: i }, asNode(a).dtype));
+    const tangentArgs = unflattenTree(tree.layout, tangents.map(boxed));
+    const tangentOutput = asNode(invoke(definition.jvp, [...args, ...tangentArgs], stack));
     if (String(tangentOutput.shape) !== String(forward.shape)) throw new Error('customJvp output shape must match the forward output');
     assertLinearTangent(tangentOutput, tangents);
-    return boxed(ir.node('custom', args.map(asNode), forward.shape, {
+    return boxed(ir.node('custom', tree.leaves.map(asNode), forward.shape, {
       forward, backward: (seed: ir.Node) => {
         const gradients = ir.vjp(tangentOutput, tangents, seed);
         // Tangent values must not survive a valid linear JVP's transposition.
@@ -84,6 +105,7 @@ function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[]): any {
       case 'literal': return a.value;
       case 'bigint': return BigInt(a.value);
       case 'array': return a.values.map(index => values[index]);
+      case 'object': return Object.fromEntries(Object.entries(a.fields).map(([key, index]) => [key, values[index]]));
       case 'binary': {
         const left = values[a.left], right = values[a.right];
         if (!isExpression(left) && !isExpression(right) && typeof left === 'number' && typeof right === 'number') {
@@ -109,7 +131,8 @@ function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[]): any {
         const intrinsic = typeof key === 'string' ? getIntrinsic(key) : undefined;
         if (isExpression(object) && intrinsic?.tensorMethod) return new IntrinsicMethod(intrinsic, object);
         if (Array.isArray(object) && typeof key === 'number') return object[key];
-        throw new Error('Kernel member access supports only shape and fixed array indexing');
+        if (object && Object.getPrototypeOf(object) === Object.prototype && typeof key === 'string' && Object.hasOwn(object, key)) return object[key];
+        throw new Error('Kernel member access supports tensor methods, shape, dtype, and fixed tree indexing');
       }
       case 'call': {
         const target = values[a.target], callArgs = a.args.map(index => values[index]);

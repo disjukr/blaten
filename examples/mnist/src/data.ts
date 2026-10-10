@@ -43,3 +43,16 @@ export function shuffle(indices: number[], seed: number): void {
     const j = state % (i + 1); [indices[i], indices[j]] = [indices[j]!, indices[i]!];
   }
 }
+
+/** Padded evaluation batches report their actual sample count; tensors belong to the caller. */
+export function* batches(dataset: Dataset, options: { size: number; batchSize: number; shuffleSeed?: number; dropLast?: boolean }) {
+  const { size, batchSize, shuffleSeed, dropLast = false } = options;
+  if (!Number.isSafeInteger(size) || size <= 0 || size > dataset.count || !Number.isSafeInteger(batchSize) || batchSize <= 0) throw new Error('Invalid batch size or dataset subset');
+  const order = Array.from({ length: size }, (_, i) => i);
+  if (shuffleSeed !== undefined) shuffle(order, shuffleSeed);
+  for (let start = 0; start < size; start += batchSize) {
+    const indices = order.slice(start, start + batchSize);
+    if (dropLast && indices.length < batchSize) break;
+    yield { indices, size: indices.length, toTensors: () => batch(dataset, indices, batchSize) };
+  }
+}

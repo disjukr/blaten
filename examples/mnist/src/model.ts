@@ -1,20 +1,27 @@
-import { matmul, relu, crossEntropy, type f32, type Tensor, type Shape } from 'blaten';
+import { crossEntropy, randn, zeros, type TensorF32 } from 'blaten';
 
 export const hiddenSize = 32;
-type F32<S extends Shape> = Tensor<S, typeof f32>;
-export type Images<Batch extends number = number> = F32<[Batch, 784]>;
-export type Labels<Batch extends number = number> = F32<[Batch, 10]>;
-export type W1 = F32<[784, typeof hiddenSize]>;
-export type B1 = F32<[typeof hiddenSize]>;
-export type W2 = F32<[typeof hiddenSize, 10]>;
-export type B2 = F32<[10]>;
-
-export function predict(x: Images, w1: W1, b1: B1, w2: W2, b2: B2) {
-  'use kernel';
-  const hidden = relu(matmul(x, w1).add(b1));
-  return matmul(hidden, w2).add(b2);
+export type Images<Batch extends number = number> = TensorF32<[Batch, 784]>;
+export type Labels<Batch extends number = number> = TensorF32<[Batch, 10]>;
+export type Parameters = {
+  w1: TensorF32<[784, typeof hiddenSize]>;
+  b1: TensorF32<[typeof hiddenSize]>;
+  w2: TensorF32<[typeof hiddenSize, 10]>;
+  b2: TensorF32<[10]>;
+};
+export function initParameters(): Parameters {
+  return {
+    w1: randn([784, hiddenSize], { seed: 1, scale: Math.sqrt(2 / 784) }),
+    b1: zeros([hiddenSize]),
+    w2: randn([hiddenSize, 10], { seed: 2, scale: Math.sqrt(2 / hiddenSize) }),
+    b2: zeros([10]),
+  };
 }
-export function loss(x: Images, y: Labels, w1: W1, b1: B1, w2: W2, b2: B2) {
+export function predict(p: Parameters, x: Images) {
   'use kernel';
-  return crossEntropy(predict(x, w1, b1, w2, b2), y);
+  return x.matmul(p.w1).add(p.b1).relu().matmul(p.w2).add(p.b2);
+}
+export function loss(p: Parameters, x: Images, y: Labels) {
+  'use kernel';
+  return crossEntropy(predict(p, x), y);
 }
