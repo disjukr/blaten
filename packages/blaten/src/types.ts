@@ -4,6 +4,8 @@ export type Shape = readonly number[];
 export interface TensorType { readonly kind: 'tensor'; readonly dtype: DType; readonly shape: Shape }
 export type ValueType = DType | TensorType;
 export interface Signature { inputs: readonly ValueType[]; output?: ValueType | readonly ValueType[] }
+export type ValueConstraint = DType | { readonly kind: 'tensor'; readonly shape: readonly (number | null)[] | null; readonly dtypes: readonly DType[] };
+export interface SignatureConstraints { readonly inputs: readonly ValueConstraint[] }
 export function sizeOf(shape: Shape): number {
   if (shape.some(n => !Number.isSafeInteger(n) || n <= 0)) {
     throw new Error('Shape dimensions must be positive integers');

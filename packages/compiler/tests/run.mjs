@@ -4,7 +4,7 @@ import { stripTypeScriptTypes } from 'node:module';
 import plugin from '@blaten/compiler';
 import { definitionOf, registerKernel, kernelIr } from 'blaten/internal';
 import { lower, signatureOf, topological } from 'blaten/backend';
-import { compile, f32, grad, tensorType, kernelIr as publicKernelIr } from 'blaten';
+import { compile, tensor, f32, f64, grad, tensorType, kernelIr as publicKernelIr } from 'blaten';
 
 const compiler = plugin();
 const source = `
@@ -21,6 +21,7 @@ const withShape = tensor([1, 2, 3, 4, 5, 6], { shape: [2, 3] });
 export function inferred(x: typeof created) { 'use kernel'; return shaped(x) }
 export function propagated(x: typeof reshaped) { 'use kernel'; return shaped(x) }
 export function explicitShape(x: typeof withShape) { 'use kernel'; return shaped(x) }
+export function captured(x: Image) { 'use kernel'; return x.add(withShape) }
 export function dynamic(x: T<[number, 3], typeof f32>) { 'use kernel'; return shaped(x) }
 export function ambiguous(x: T<[2, 3]>) { 'use kernel'; return shaped(x) }
 export function mask(x: T<[2], typeof bool>) { 'use kernel'; return x.not() }
@@ -48,6 +49,9 @@ assert.ok(transformed?.code);
 const code = stripTypeScriptTypes(transformed.code, { mode: 'strip' }).replace(/(['"])(blaten(?:\/internal)?)\1/g, (_, quote, name) => JSON.stringify(import.meta.resolve(name)));
 const module = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 assert.equal(kernelIr, Symbol.for('blaten.kernel'));
+const captured = lower(module.captured, { inputs: [tensorType([2, 3])] });
+const capturedConstant = topological(captured.outputs).find(node => node.op === 'constant' && node.attrs.data);
+assert.deepEqual([...capturedConstant.attrs.data], [1, 2, 3, 4, 5, 6]);
 assert.equal(publicKernelIr, kernelIr);
 // Import a second runtime instance: it must read symbols written by the first.
 const otherRuntime = await import(`${import.meta.resolve('blaten/internal')}?symbol-contract`);
@@ -119,4 +123,16 @@ for (const fn of [module.dynamic, module.ambiguous, module.optional, module.impl
 const backend = { async compile(fn) { const program = lower(fn, signatureOf(fn)); return { dispatchCount: 1, program, run() {}, dispose() {} } } };
 assert.deepEqual((await compile(module.concrete, backend)).program.inputs[0].shape, [2, 3]);
 await assert.rejects(compile(module.dynamic, backend), /Cannot compile/);
+const example = tensor([[1, 2, 3], [4, 5, 6]]);
+assert.deepEqual(signatureOf(module.dynamic, [example]), { inputs: [tensorType([2, 3])] });
+assert.deepEqual(signatureOf(grad(module.shaped), [example]), { inputs: [tensorType([2, 3])] });
+assert.deepEqual(signatureOf(module.ambiguous, [tensor([[1, 2, 3], [4, 5, 6]], { dtype: f64 })]), { inputs: [tensorType([2, 3], f64)] });
+assert.throws(() => signatureOf(module.dynamic, [tensor([[1, 2]])]), /expected shape/);
+assert.throws(() => signatureOf(module.concrete, [tensor([[1, 2, 3], [4, 5, 6]], { dtype: f64 })]), /expected dtype/);
+assert.throws(() => signatureOf(module.scalarBool, [1]), /expected scalar/);
+assert.throws(() => signatureOf(module.implicit, [example]), /Cannot compile/);
+const destroyed = tensor([[1, 2, 3]]); destroyed.dispose();
+assert.throws(() => signatureOf(module.dynamic, [destroyed]), /disposed/);
+const inputBackend = { ...backend, async compile(fn, options) { return { program: lower(fn, signatureOf(fn, options?.inputs)) } } };
+assert.deepEqual((await compile(module.dynamic, inputBackend, { inputs: [example] })).program.inputs[0].shape, [2, 3]);
 console.log('Passed: type-derived signatures, wrapper specialization, runtime signature errors, AST-to-IR build boundary, shape specialization, external references, helpers, direct IR registration, and build-time syntax validation.');

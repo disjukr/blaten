@@ -1,4 +1,5 @@
-import { Tensor } from './tensor.js';
+import { Tensor, hostData } from './tensor.js';
+import { execute } from './execution.js';
 import * as ir from './ir.js';
 import { mapKernel } from './lowering.js';
 import { kernelIr } from './kernel.js';
@@ -34,7 +35,7 @@ export function toNode(value: unknown): ir.Node {
   if (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'boolean') return ir.constant(value);
   if (value instanceof Tensor) {
     const tensor = value as Tensor;
-    return ir.node('constant', [], tensor.shape, { data: tensor.data }, tensor.dtype);
+    return ir.node('input', [], tensor.shape, { tensor }, tensor.dtype);
   }
   throw new Error('Expected a tensor or number');
 }
@@ -67,8 +68,8 @@ function arithmetic(op: 'add' | 'sub' | 'mul' | 'div', a: number | bigint, b: nu
   const x = Number(a), y = Number(b);
   switch (op) { case 'add': return x + y; case 'sub': return x - y; case 'mul': return x * y; case 'div': return x / y }
 }
-export function evaluateCpu(root: ir.Node): HostStorage {
-  const cache = new Map<ir.Node, HostStorage>();
+export function evaluateCpu(root: ir.Node, bindings: ReadonlyMap<ir.Node, HostStorage> = new Map()): HostStorage {
+  const cache = new Map<ir.Node, HostStorage>(bindings);
   const evaluate = (n: ir.Node): HostStorage => {
     const old = cache.get(n); if (old) return old;
     const out = makeStorage(n.dtype, sizeOf(n.shape)) as any;
@@ -129,6 +130,8 @@ export function evaluateCpu(root: ir.Node): HostStorage {
 }
 function finish(n: ir.Node, inputs: readonly unknown[]): any {
   if (inputs.some(x => x instanceof ir.Expression)) return new ir.Expression(n);
+  const nodes = ir.topological([n]).filter(node => node.op === 'input');
+  if (nodes.length) return execute({ inputs: nodes, outputs: [n], single: true }, nodes.map(node => node.attrs.tensor));
   const values = evaluateCpu(n);
   if (inputs.every(x => typeof x === 'number' || typeof x === 'bigint' || typeof x === 'boolean') && n.shape.length === 0) return n.dtype === bool ? Boolean(values[0]) : values[0];
   return new Tensor(values, n.shape, n.dtype);
@@ -184,9 +187,9 @@ export const crossEntropy = register('crossEntropy', <D extends DType>(logits: T
 export const map = register('map', <D extends DType>(fn: (x: ScalarOf<D>) => Scalar, x: Tensor<Shape, D>): Tensor<Shape, DType> => {
   if (Object.hasOwn(fn, kernelIr)) {
     const result = mapKernel(fn, toNode(x));
-    return new Tensor(evaluateCpu(result), result.shape, result.dtype);
+    return finish(result, [x]);
   }
-  const values = Array.from(x.data as any, (value: any) => fn((x.dtype === bool ? Boolean(value) : value) as ScalarOf<D>));
+  const values = Array.from(hostData(x) as any, (value: any) => fn((x.dtype === bool ? Boolean(value) : value) as ScalarOf<D>));
   const dtype = values.every(value => typeof value === 'boolean') ? bool : x.dtype === bool ? f32 : x.dtype;
   return new Tensor<Shape, DType>(makeStorage<DType>(dtype, values), x.shape, dtype);
 }, [0]);

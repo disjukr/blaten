@@ -7,6 +7,24 @@ export interface DeviceStorage<D extends DType = DType> {
   read(): Promise<HostStorage<D>>;
   dispose(): void;
 }
+const storages = new WeakMap<Tensor, HostStorage | DeviceStorage>();
+/** Backend-only access; storage is deliberately absent from Tensor's public API. */
+export function storageOf<D extends DType>(tensor: Tensor<Shape, D>): HostStorage<D> | DeviceStorage<D> {
+  tensor.assertAlive();
+  const storage = storages.get(tensor);
+  if (!storage) throw new Error('Unknown tensor storage');
+  return storage as HostStorage<D> | DeviceStorage<D>;
+}
+export function hostData<D extends DType>(tensor: Tensor<Shape, D>): HostStorage<D> {
+  const storage = storageOf(tensor);
+  if (!isHostStorage(storage)) throw new Error('Tensor is not host-resident; use read() to obtain host values');
+  return storage;
+}
+export function deviceStorageOf<D extends DType>(tensor: Tensor<Shape, D>): DeviceStorage<D> {
+  const storage = storageOf(tensor);
+  if (isHostStorage(storage)) throw new Error('Tensor is host-resident');
+  return storage;
+}
 type Nested = Scalar | readonly Nested[];
 type NestedOf<S extends Scalar> = S | readonly NestedOf<S>[];
 type ArithmeticResult<D extends DType> = D extends FloatDType ? D : DType;
@@ -17,7 +35,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
   readonly strides: readonly number[];
   readonly size: number;
   private disposed = false;
-  constructor(readonly storage: HostStorage<D> | DeviceStorage<D>, shape: S, readonly dtype: D = f32 as D) {
+  constructor(storage: HostStorage<D> | DeviceStorage<D>, shape: S, readonly dtype: D = f32 as D) {
     if (!isDType(dtype)) throw new Error(`Unknown dtype ${dtype}`);
     this.size = sizeOf(shape);
     this.shape = Object.freeze([...shape]) as unknown as Readonly<S>;
@@ -30,20 +48,14 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
     }
     if (isHostStorage(storage) && storageDType(storage) !== (dtype === bool ? 'u8' : dtype)) throw new Error('Storage array does not match tensor dtype');
     if (dtype === bool && isHostStorage(storage) && Array.from(storage as any).some(value => value !== 0 && value !== 1)) throw new Error('bool storage must contain only 0 or 1');
+    storages.set(this, storage);
   }
   get rank(): S['length'] { return this.shape.length }
   get isDisposed() { return this.disposed }
   assertAlive() { if (this.disposed) throw new Error('Tensor is disposed') }
-  get data(): HostStorage<D> {
-    this.assertAlive();
-    if (!isHostStorage(this.storage)) {
-      throw new Error('GPU tensor: use await tensor.read() before accessing CPU data');
-    }
-    return this.storage as HostStorage<D>;
-  }
   async read(): Promise<HostStorage<D>> {
-    this.assertAlive();
-    return (isHostStorage(this.storage) ? this.storage.slice() : await this.storage.read()) as HostStorage<D>;
+    const storage = storageOf(this);
+    return (isHostStorage(storage) ? storage.slice() : await storage.read()) as HostStorage<D>;
   }
   async item(): Promise<ScalarOf<D>> {
     if (this.size !== 1) throw new Error('item() requires a one-element tensor');
@@ -79,7 +91,8 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
   mean(axis?: number | readonly number[], keepDims = false): Tensor<Shape, FloatResult<D>> { return intrinsics.mean(this, axis, keepDims) as Tensor<Shape, FloatResult<D>> }
   softmax(): Tensor<S, FloatResult<D>> { return intrinsics.softmax(this) as Tensor<S, FloatResult<D>> }
   dispose() {
-    if (!this.disposed && !isHostStorage(this.storage)) this.storage.dispose();
+    const storage = storages.get(this);
+    if (!this.disposed && storage && !isHostStorage(storage)) storage.dispose();
     this.disposed = true;
   }
 }

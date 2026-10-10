@@ -1,10 +1,12 @@
+import { hostData } from 'blaten/backend';
 import { registerKernel } from 'blaten/internal';
 import type { Backend, Signature, Shape } from 'blaten';
 import type { KernelFunction } from 'blaten/backend';
 import assert from 'node:assert/strict';
 import { create, globals } from 'webgpu';
 import { tensor, tensorType, bool, i8, u8, i16, u16, i32, u32, i64, u64, f16, f32, f64, compile, grad, valueAndGrad, customVjp, customJvp, map, sum, mul, add, matmul, relu, crossEntropy, reshape, type Tensor, type DType } from 'blaten';
-import { typegpu } from '@blaten/typegpu';
+import { typegpu, inspect } from '@blaten/typegpu';
+import { sgd } from 'blaten';
 import { square } from './helper.js';
 
 function concreteSquares(x: Tensor<[4], typeof f32>) { 'use kernel'; return squares(x) }
@@ -61,13 +63,39 @@ export async function main() {
     const concrete = await compile(concreteSquares, backend);
     const concreteResult = concrete.run(tensor([1, 2, 3, 4])) as Tensor<Shape, typeof f32>;
     assert.equal(await concreteResult.item(), 30);
-    assert.equal(concrete.dispatchCount, 1);
+    assert.equal(inspect(concrete).dispatchCount, 1);
     concreteResult.dispose(); concrete.dispose();
-    for (const dtype of backend.supportedDTypes) {
+    const inputProgram = await compile(unresolvedSquares, backend, { inputs: [tensor([1, 2, 3])] });
+    assert.equal('dispatchCount' in inputProgram, false);
+    const inputResult = inputProgram.run(tensor([2, 3, 4])) as Tensor;
+    assert.equal(await inputResult.item(), 29); inputResult.dispose();
+    assert.throws(() => inputProgram.run(tensor([1, 2])), /expected/);
+    await assert.rejects(compile(unresolvedSquares, backend, { inputs: [tensor([1, 2], { dtype: i32 })] }), /expected dtype/);
+    inputProgram.dispose();
+    const gpuInput = await backend.copyFrom(tensor([1, 2, 3]));
+    assert.equal('storage' in gpuInput, false);
+    assert.equal('data' in gpuInput, false);
+    const savedRead = gpuInput.read;
+    gpuInput.read = async () => { throw new Error('Direct GPU operations must not read host data') };
+    let direct: Tensor;
+    try { direct = gpuInput.mul(gpuInput).sum() }
+    finally { gpuInput.read = savedRead }
+    assert.equal(await direct.item(), 14);
+    const changedInput = await backend.copyFrom(tensor([2, 3, 4]));
+    const changedOutput = changedInput.mul(changedInput).sum();
+    assert.equal(await changedOutput.item(), 29);
+    assert.equal(await direct.item(), 14, 'Cached direct plans must preserve prior outputs');
+    assert.throws(() => gpuInput.add(tensor([1, 2, 3])), /copyFrom/);
+    const gpuMap = map(square, gpuInput);
+    near(await gpuMap.read() as ArrayLike<number>, [1, 4, 9]); gpuMap.dispose();
+    direct.dispose(); changedOutput.dispose(); changedInput.dispose(); gpuInput.dispose();
+    await backend.synchronize();
+    for (const dtype of backend.capabilities.dtypes) {
       const source = tensor(dtype === bool ? [true, false, true] : [1, 2, 3], { dtype });
-      const uploaded = backend.upload(source);
+      const uploaded = await backend.copyFrom(source);
+      assert.notEqual(uploaded, source);
       assert.equal(uploaded.dtype, dtype);
-      assert.deepEqual(Array.from<number | bigint>(await uploaded.read()), Array.from<number | bigint>(source.data));
+      assert.deepEqual(Array.from<number | bigint>(await uploaded.read()), Array.from<number | bigint>(hostData(source)));
       const castProgram = await compileForTest(dtypeCast, backend, { inputs: [tensorType([3], dtype)] });
       const converted = castProgram.run(uploaded) as Tensor<Shape, typeof f32>;
       near(await converted.read(), dtype === bool ? [1, 0, 1] : [1, 2, 3]); converted.dispose();
@@ -89,7 +117,7 @@ export async function main() {
         const overflowInput = dtype === i8 ? [127, -128, 64] : dtype === u8 ? [255, 128, 0] : dtype === i16 ? [32767, -32768, 1000] : dtype === u16 ? [65535, 32768, 1000] : dtype === i32 ? [2147483647, -2147483648, 65537] : dtype === u32 ? [4294967295, 2147483648, 65537] : [0.1, -0.5, 1.25];
         const overflowSource = tensor(overflowInput, { dtype });
         const overflow = arithmetic.run(overflowSource) as Tensor<Shape, DType>;
-        assert.deepEqual(Array.from<number | bigint>(await overflow.read()), Array.from<number | bigint>(dtypeArithmetic(overflowSource).data), `${dtype}: GPU and CPU overflow/rounding must agree`);
+        assert.deepEqual(Array.from<number | bigint>(await overflow.read()), Array.from<number | bigint>(hostData(dtypeArithmetic(overflowSource))), `${dtype}: GPU and CPU overflow/rounding must agree`);
         overflow.dispose();
         if (dtype === f16) {
           const derivative = await compileForTest(grad(chained), backend, { inputs: [tensorType([3], f16)] });
@@ -97,20 +125,37 @@ export async function main() {
           assert.equal(gradient.dtype, f16); near(await gradient.read(), [2, 4, 6]); gradient.dispose();
           const softmax = await compileForTest(dtypeSoftmax, backend, { inputs: [tensorType([3], f16)] });
           const probabilities = softmax.run(overflowSource) as Tensor<Shape, typeof f16>;
-          near(await probabilities.read(), dtypeSoftmax(overflowSource).data as ArrayLike<number>, 1e-3); probabilities.dispose();
+          near(await probabilities.read(), hostData(dtypeSoftmax(overflowSource)) as ArrayLike<number>, 1e-3); probabilities.dispose();
         }
       } else {
         const logic = await compileForTest(dtypeLogic, backend, { inputs: [tensorType([3], bool)] });
         const result = logic.run(uploaded) as Tensor<Shape, typeof bool>;
         assert.deepEqual(Array.from<number | bigint>(await result.read()), [0, 1, 0]); result.dispose();
       }
+      const originalRead = uploaded.read;
+      uploaded.read = async () => { throw new Error('Same-backend copying must stay on the GPU') };
+      let copied: Tensor<Shape, DType>;
+      try { copied = await backend.copyFrom(uploaded) }
+      finally { uploaded.read = originalRead }
+      assert.notEqual(copied, uploaded);
       uploaded.dispose();
+      assert.deepEqual(Array.from<number | bigint>(await copied.read()), Array.from<number | bigint>(hostData(source)), 'Copies survive disposal of the source');
+      copied.dispose();
+      assert.equal(source.isDisposed, false);
     }
+    const hostSource = tensor([1, 2, 3]);
+    const hostCopy = await backend.copyFrom(hostSource);
+    hostData(hostSource)[0] = 99;
+    near(await hostCopy.read(), [1, 2, 3]);
+    hostCopy.dispose();
+    assert.equal(hostData(hostSource)[0], 99, 'Disposing a copy must not dispose its source');
+    hostSource.dispose();
+    await assert.rejects(backend.copyFrom(hostSource), /disposed/);
     const castSource = tensor([3e9, -3e9, 4294967296, -2.9, 2.9, NaN, Infinity, -Infinity]);
     for (const fn of [dtypeCastSigned32, dtypeCastUnsigned32, dtypeCastBool]) {
       const casts = await compileForTest(fn, backend, { inputs: [tensorType([8])] });
       const output = casts.run(castSource) as Tensor<Shape, DType>;
-      assert.deepEqual(Array.from<number | bigint>(await output.read()), Array.from<number | bigint>(fn(castSource).data)); output.dispose();
+      assert.deepEqual(Array.from<number | bigint>(await output.read()), Array.from<number | bigint>(hostData(fn(castSource)))); output.dispose();
     }
     const infinity = await compileForTest(nonfiniteConstant, backend, { inputs: [tensorType([1])] });
     const infiniteValue = infinity.run(tensor([1])) as Tensor<Shape, typeof f32>;
@@ -119,19 +164,26 @@ export async function main() {
     assert.ok(noHalfAdapter);
     const noHalfDevice = await noHalfAdapter.requestDevice();
     const noHalfBackend = await typegpu({ device: noHalfDevice });
-    try { await assert.rejects(compileForTest(dtypeArithmetic, noHalfBackend, { inputs: [tensorType([3], f16)] }), /shader-f16/) }
+    try {
+      await assert.rejects(compileForTest(dtypeArithmetic, noHalfBackend, { inputs: [tensorType([3], f16)] }), /shader-f16/);
+      const source = await backend.copyFrom(tensor([4, 5, 6]));
+      const copy = await noHalfBackend.copyFrom(source);
+      assert.throws(() => source.add(copy), /copyFrom/);
+      source.dispose();
+      near(await copy.read(), [4, 5, 6]); copy.dispose();
+    }
     finally { noHalfBackend.dispose(); noHalfDevice.destroy() }
     for (const dtype of [f64, i64, u64]) {
       await assert.rejects(compileForTest(dtypeArithmetic, backend, { inputs: [tensorType([3], dtype)] }), /does not support/);
-      assert.throws(() => backend.upload(tensor([1, 2, 3], { dtype })), /does not support/);
+      await assert.rejects(backend.copyFrom(tensor([1, 2, 3], { dtype })), /does not support/);
     }
     await assert.rejects(compileForTest(bigintLiteral, backend, { inputs: [tensorType([3], i64)] }), /does not support/);
     const fused = await compileForTest(squares, backend, { inputs: [tensorType([4])] });
-    assert.equal(fused.dispatchCount, 1, 'map + multiply + sum must be one compute dispatch');
+    assert.equal(inspect(fused).dispatchCount, 1, 'map + multiply + sum must be one compute dispatch');
     const value = fused.run(tensor([1, 2, 3, 4])) as Tensor<Shape, typeof f32>;
     assert.equal(await value.item(), 30); value.dispose();
     const methods = await compileForTest(chained, backend, { inputs: [tensorType([4])] });
-    assert.equal(methods.dispatchCount, 1);
+    assert.equal(inspect(methods).dispatchCount, 1);
     near(await (methods.run(tensor([1, 2, 3, 4])) as Tensor<Shape, typeof f32>).read(), [30]);
     const differentiate = await compileForTest(grad(squares), backend, { inputs: [tensorType([4])] });
     near(await (differentiate.run(tensor([1, 2, 3, 4])) as Tensor<Shape, typeof f32>).read(), [2, 4, 6, 8]);
@@ -166,8 +218,8 @@ export async function main() {
     const softmaxGrad = await compileForTest(grad(smooth), backend, { inputs: [tensorType([3])] });
     const z = tensor([0.3, -0.7, 1.2]), expectedSoftmax = new Float32Array(3);
     for (let i = 0; i < 3; i++) {
-      const original = z.data[i]!; z.data[i] = original + 1e-3; const upper = await smooth(z).item();
-      z.data[i] = original - 1e-3; const lower = await smooth(z).item(); z.data[i] = original;
+      const original = hostData(z)[i]!; hostData(z)[i] = original + 1e-3; const upper = await smooth(z).item();
+      hostData(z)[i] = original - 1e-3; const lower = await smooth(z).item(); hostData(z)[i] = original;
       expectedSoftmax[i] = (upper - lower) / 2e-3;
     }
     near(await (softmaxGrad.run(z) as Tensor<Shape, typeof f32>).read(), expectedSoftmax, 3e-4);
@@ -180,21 +232,21 @@ export async function main() {
     for (const [parameter, gradient] of [[w, dw!], [b, db!]]) {
       const expected = new Float32Array(parameter!.size), epsilon = 1e-3;
       for (let i = 0; i < parameter!.size; i++) {
-        const original = parameter!.data[i]!;
-        parameter!.data[i] = original + epsilon; const upper = await loss(x, w, b, y).item();
-        parameter!.data[i] = original - epsilon; const lower = await loss(x, w, b, y).item();
-        parameter!.data[i] = original; expected[i] = (upper - lower) / (2 * epsilon);
+        const original = hostData(parameter!)[i]!;
+        hostData(parameter!)[i] = original + epsilon; const upper = await loss(x, w, b, y).item();
+        hostData(parameter!)[i] = original - epsilon; const lower = await loss(x, w, b, y).item();
+        hostData(parameter!)[i] = original; expected[i] = (upper - lower) / (2 * epsilon);
       }
       near(await gradient!.read(), expected, 3e-4);
     }
-    const uploaded = [backend.upload(w), backend.upload(b)];
-    backend.sgd(uploaded, [dw!, db!], 0.1);
+    const uploaded = await Promise.all([backend.copyFrom(w), backend.copyFrom(b)]);
+    sgd(uploaded, { learningRate: 0.1 }).step([dw!, db!]);
     const before = await actualLoss!.item();
     const after = training.run(x, uploaded[0]!, uploaded[1]!, y) as Tensor<Shape, typeof f32>[];
     assert.ok(await after[0]!.item() < before, 'GPU SGD should reduce loss');
-    await device.queue.onSubmittedWorkDone();
+    await backend.synchronize();
     assert.deepEqual(errors, [], 'WebGPU validation must pass');
-    console.log(`Passed GPU dtypes: ${backend.supportedDTypes.join(', ')}; unsupported f64/i64/u64 and missing shader-f16 are rejected.`);
+    console.log(`Passed GPU dtypes: ${backend.capabilities.dtypes.join(', ')}; unsupported f64/i64/u64 and missing shader-f16 are rejected.`);
     console.log('Passed: GPU fusion, imported helpers, gradients, 5th derivatives, custom VJP/JVP, finite differences, shapes, and GPU SGD.');
   } finally { backend.dispose(); device.destroy() }
 }

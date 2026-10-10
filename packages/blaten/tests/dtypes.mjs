@@ -1,13 +1,30 @@
+import { hostData } from 'blaten/backend';
 import assert from 'node:assert/strict';
-import { tensor, zeros, ones, randn, bool, i8, u8, i16, u16, i32, u32, i64, u64, f16, f32, f64, grad, sum, map, log, tensorType } from 'blaten';
+import { tensor, zeros, ones, randn, bool, i8, u8, i16, u16, i32, u32, i64, u64, f16, f32, f64, grad, sum, map, log, tensorType, sgd } from 'blaten';
 import { lower } from 'blaten/backend';
 import { registerKernel } from 'blaten/internal';
 import { evaluateCpu } from 'blaten/intrinsics';
 const cases = [[bool, Uint8Array], [i8, Int8Array], [u8, Uint8Array], [i16, Int16Array], [u16, Uint16Array], [i32, Int32Array], [u32, Uint32Array], [i64, BigInt64Array], [u64, BigUint64Array], [f16, Float16Array], [f32, Float32Array], [f64, Float64Array]];
+for (const dtype of [f16, f32, f64]) {
+  const p = tensor([2, 4], { dtype }), g = tensor([1, 2], { dtype });
+  const optimizer = sgd([p], { learningRate: 0.5 });
+  optimizer.step([g]); optimizer.step([g]);
+  assert.deepEqual(Array.from(await p.read()), [1, 2]);
+  assert.deepEqual(Array.from(await g.read()), [1, 2]);
+  const copy = await p.read(); copy[0] = 99;
+  assert.equal(await p.sum().item(), 3, 'read() must return an independent host snapshot');
+  assert.equal('storage' in p, false); assert.equal('data' in p, false);
+}
+const p1 = tensor([2]), p2 = tensor([4]);
+const optimizer = sgd([p1, p2], { learningRate: 1 });
+assert.throws(() => optimizer.step([tensor([1]), tensor([1, 2])]), /matching/);
+assert.equal(await p1.item(), 2, 'Invalid gradients must be rejected before any parameter is changed');
+assert.throws(() => sgd([p1, p1], { learningRate: 1 }), /distinct/);
+assert.throws(() => sgd([p1], { learningRate: NaN }), /learning rate/);
 for (const [dtype, Constructor] of cases) {
   const x = tensor(dtype === bool ? [true, false] : [1, 2], { dtype });
   assert.equal(x.dtype, dtype);
-  assert.ok(x.data instanceof Constructor);
+  assert.ok(hostData(x) instanceof Constructor);
   assert.ok(await x.read() instanceof Constructor);
   assert.equal(zeros([2], { dtype }).dtype, dtype);
   assert.equal(ones([2], { dtype }).dtype, dtype);
@@ -15,7 +32,7 @@ for (const [dtype, Constructor] of cases) {
   if (dtype !== bool) {
     assert.deepEqual(Array.from(await x.mul(2).read()), dtype === i64 || dtype === u64 ? [2n, 4n] : [2, 4]);
     assert.equal(await x.sum().item(), dtype === i64 || dtype === u64 ? 3n : 3);
-    assert.deepEqual(Array.from(x.gt(1).data), [0, 1]);
+    assert.deepEqual(Array.from(hostData(x.gt(1))), [0, 1]);
   }
 }
 assert.equal(tensor([true, false]).dtype, bool);
@@ -26,12 +43,12 @@ assert.equal(tensor(new Int32Array([1, 2])).dtype, i32);
 assert.equal(tensor([1, 2]).dtype, f32);
 assert.equal(await tensor([true, false, true]).sum().item(), 2);
 assert.throws(() => tensor([true]).add(tensor([false])), /Boolean arithmetic/);
-assert.deepEqual(Array.from(tensor([true, false]).cast(f32).data), [1, 0]);
-assert.deepEqual(Array.from(tensor([0, 2, -1]).cast(bool).data), [0, 1, 1]);
-assert.deepEqual(Array.from(tensor([NaN, Infinity, -Infinity, -0]).cast(bool).data), [1, 1, 1, 0]);
-assert.deepEqual(Array.from(tensor([true, false]).not().data), [0, 1]);
-assert.deepEqual(Array.from(tensor([true, false]).and(true).data), [1, 0]);
-assert.deepEqual(Array.from(tensor([true, false]).or(true).data), [1, 1]);
+assert.deepEqual(Array.from(hostData(tensor([true, false]).cast(f32))), [1, 0]);
+assert.deepEqual(Array.from(hostData(tensor([0, 2, -1]).cast(bool))), [0, 1, 1]);
+assert.deepEqual(Array.from(hostData(tensor([NaN, Infinity, -Infinity, -0]).cast(bool))), [1, 1, 1, 0]);
+assert.deepEqual(Array.from(hostData(tensor([true, false]).not())), [0, 1]);
+assert.deepEqual(Array.from(hostData(tensor([true, false]).and(true))), [1, 0]);
+assert.deepEqual(Array.from(hostData(tensor([true, false]).or(true))), [1, 1]);
 assert.throws(() => tensor([1]).not(), /bool inputs/);
 assert.equal(await tensor([0.1], { dtype: f16 }).item(), 0.0999755859375);
 assert.equal(await tensor([1], { dtype: f64 }).add(2 ** -40).item(), 1 + 2 ** -40);
@@ -45,7 +62,7 @@ assert.equal(tensor([1], { dtype: i8 }).add(tensor([1], { dtype: u8 })).dtype, i
 assert.equal(tensor([1], { dtype: i32 }).div(2).dtype, f32);
 assert.equal(tensor([1], { dtype: i8 }).add(128).dtype, f32);
 assert.equal(tensor([1], { dtype: f16 }).add(tensor([1], { dtype: f64 })).dtype, f64);
-assert.equal(tensor([[1, 2]], { dtype: i64 }).matmul(tensor([[3], [4]], { dtype: i64 })).data[0], 11n);
+assert.equal(hostData(tensor([[1, 2]], { dtype: i64 }).matmul(tensor([[3], [4]], { dtype: i64 })))[0], 11n);
 assert.throws(() => tensor([9007199254740992], { dtype: i64 }), /safe integer/);
 assert.throws(() => randn([2], { dtype: i32 }), /floating dtype/);
 const logarithm = registerKernel(x => log(x), {
@@ -63,7 +80,7 @@ const maskKernel = registerKernel(x => x > 1, {
   },
 });
 assert.equal(map(maskKernel, tensor([1, 2], { dtype: f64 })).dtype, bool);
-assert.deepEqual(Array.from(map(maskKernel, tensor([1, 2], { dtype: f64 })).data), [0, 1]);
+assert.deepEqual(Array.from(hostData(map(maskKernel, tensor([1, 2], { dtype: f64 })))), [0, 1]);
 
 const squaredSum = registerKernel(x => x.mul(x).sum(), {
   version: 2, name: 'squaredSum', externals: { sum: () => sum }, ir: {
@@ -75,7 +92,7 @@ for (const dtype of [f16, f32, f64]) {
   assert.equal(program.outputs[0].dtype, dtype);
   // Replace symbolic input by a typed constant to execute the differentiated graph on CPU.
   const input = program.inputs[0];
-  Object.assign(input, { op: 'constant', attrs: { data: tensor([1.5, 2.5], { dtype }).data } });
+  Object.assign(input, { op: 'constant', attrs: { data: hostData(tensor([1.5, 2.5], { dtype })) } });
   assert.deepEqual(Array.from(evaluateCpu(program.outputs[0])), [3, 5]);
 }
 assert.throws(() => lower(grad(squaredSum), { inputs: [tensorType([2], i32)] }), /floating outputs and targets/);

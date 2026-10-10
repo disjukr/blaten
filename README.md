@@ -33,7 +33,7 @@ pnpm mnist
 
 MNIST downloads the [CVDF IDX files](https://storage.googleapis.com/cvdf-datasets/mnist/) on first use and caches them in `examples/mnist/data/`. Defaults are 12,000 training images, 2,000 separate test images, batch size 64, and three epochs. Use `TRAIN_SIZE=60000` and `TEST_SIZE=10000` for the full dataset. `EPOCHS` and `LEARNING_RATE` are also configurable through environment variables.
 
-The model's `Images` and `Labels` types leave the batch dimension as `number`. `kernels.ts` sets `batchSize = 64` and specializes the compilation entry points with `Images<typeof batchSize>` and `Labels<typeof batchSize>`. `model.ts` sets `hiddenSize = 32`. Change these constants and recompile to use other sizes. Results are written to `examples/mnist/results/latest.json`.
+The model's `Images` and `Labels` types leave the batch dimension as `number`. Compilation specializes them from example inputs; set `BATCH_SIZE` to change the batch size without editing model wrappers. `model.ts` sets `hiddenSize = 32`. Results are written to `examples/mnist/results/latest.json`.
 
 A verified run improved test accuracy from **12.65% to 88.75%** and epoch-average loss from **0.6756 to 0.2791**. The measurements and environment are recorded in [verification.json](examples/mnist/verification.json). Results depend on configuration and hardware.
 
@@ -50,9 +50,9 @@ export default defineConfig({ plugins: [blaten()] });
 
 ```ts
 import { tensor, f32, compile, grad, type Tensor, type Shape } from 'blaten';
-import { typegpu } from '@blaten/typegpu';
+import { typegpu, inspect } from '@blaten/typegpu';
 
-function squaredSum(x: Tensor<[3], typeof f32>) {
+function squaredSum(x: Tensor<[number], typeof f32>) {
   'use kernel';
   return x.mul(x).sum();
 }
@@ -60,12 +60,12 @@ function squaredSum(x: Tensor<[3], typeof f32>) {
 // Uses navigator.gpu in a browser.
 const backend = await typegpu();
 const input = tensor([1, 2, 3]);
-const program = await compile(squaredSum, backend);
+const program = await compile(squaredSum, backend, { inputs: [input] });
 const result = program.run(input) as Tensor<Shape, typeof f32>;
 console.log(await result.item()); // 14
-console.log(program.dispatchCount); // 1: multiply and sum share a shader
+console.log(inspect(program).dispatchCount); // 1: multiply and sum share a shader
 
-const derivative = await compile(grad(squaredSum), backend);
+const derivative = await compile(grad(squaredSum), backend, { inputs: [input] });
 const gradient = derivative.run(input) as Tensor<Shape, typeof f32>;
 console.log(await gradient.read()); // Float32Array [2, 4, 6]
 
@@ -89,11 +89,13 @@ backend.dispose();
 device.destroy(); // The caller owns externally supplied devices.
 ```
 
-Calling a kernel directly executes ordinary JavaScript on the CPU. For example, `squaredSum(tensor([1, 2, 3], { shape: [3] }))` computes on the CPU. `compile()` specializes kernel IR using the function's registered input signature and creates a program for fixed input shapes and dtypes.
+Calling a kernel directly executes its ordinary JavaScript body. Tensor operations execute in their inputs' environment: host tensors use the CPU reference implementation, while GPU tensors submit GPU operations. Direct calls execute operation by operation; `compile()` uses kernel IR to fuse operations across the function. Mixing host and device tensors, or tensors belonging to different backends, requires an explicit `await destination.copyFrom(source)` first. JS scalars can be used with tensors in either environment.
 
 `run()` submits GPU commands and immediately returns GPU-backed tensors; it does not wait for computation to finish. `read()` and `item()` asynchronously wait for the data and copy it to the CPU. Outputs have independent storage, so later executions do not overwrite them. Dispose them when no longer needed.
 
-An executable owns reusable input, intermediate, and constant buffers. `program.dispose()` releases those buffers; disposing the backend also disposes its remaining executables and GPU tensors. `dispatchCount` reports compute dispatches per execution, not queue submissions or elapsed GPU time. One compiled function can contain several dispatches submitted together.
+Executables lease reusable input, intermediate, and constant buffers. `program.dispose()` returns these buffers to the backend's pool. TypeGPU retains up to 64 MiB of free workspace and up to 32 cached plans for direct operations. Result tensors have independent storage. Disposing the backend also disposes its executables, GPU tensors, and pooled resources.
+
+The common backend exposes `capabilities.dtypes`, `copyFrom()`, `compile()`, `synchronize()`, and `dispose()`. `await backend.synchronize()` waits for submitted work without reading a tensor. Backend-specific diagnostics live in `@blaten/typegpu`: `inspect(program)` reports `dispatchCount` and leased `workspaceBytes`. Dispatch count measures compute dispatches per execution, not queue submissions or elapsed time. One compiled function can submit several dispatches together.
 
 `tensor([[1, 2], [3, 4]])` infers its shape. For TypedArrays, use `tensor(values, { shape: [2, 2] })` to specify a shape. `zeros(shape)`, `ones(shape)`, and `randn(shape, { seed, scale })` are also available.
 
@@ -113,7 +115,7 @@ const values = mask.cast(i32);
 const inverse = mask.not();
 ```
 
-The `data` and `read()` types of `Tensor<S, D>` reflect the corresponding TypedArray. Bool uses a Uint8Array containing 0 or 1, while `item()` returns a boolean. i64/u64 use BigInt64Array/BigUint64Array and bigint scalars. f16 requires native Float16Array; creating an f16 host tensor reports a feature-support error if it is unavailable.
+`Tensor<S, D>.read()` returns a fresh host snapshot with the corresponding TypedArray type. Tensors expose neither a mutable `data` field nor their storage; backend implementations access storage through `blaten/backend`. Bool uses a Uint8Array containing 0 or 1, while `item()` returns a boolean. i64/u64 use BigInt64Array/BigUint64Array and bigint scalars. f16 requires native Float16Array; creating an f16 host tensor reports a feature-support error if it is unavailable.
 
 | Dtype | CPU execution | TypeGPU |
 | --- | --- | --- |
@@ -122,7 +124,7 @@ The `data` and `read()` types of `Tensor<S, D>` reflect the corresponding TypedA
 | f32 | Supported | Supported |
 | f64, i64/u64 | Supported | Rejected; no implicit precision downgrade |
 
-`backend.supportedDTypes` lists the dtypes supported by the device. When `typegpu()` creates a device, it enables shader-f16 if supported by the adapter. For an external device, request shader-f16 through `requiredFeatures` yourself. Native shader scalar types follow the [WGSL specification](https://www.w3.org/TR/WGSL/#scalar-types).
+`backend.capabilities.dtypes` lists the dtypes supported by the device. When `typegpu()` creates a device, it enables shader-f16 if supported by the adapter. For an external device, request shader-f16 through `requiredFeatures` yourself. Native shader scalar types follow the [WGSL specification](https://www.w3.org/TR/WGSL/#scalar-types).
 
 Promotion prefers the wider floating type. Integer promotion widens to accommodate signed/unsigned ranges; mixing i64 and u64 promotes to f64. Weak JS scalar literals adopt a tensor's dtype when representable. Integer overflow wraps at the fixed bit width. Integer division and integer exp/log/tanh/mean/softmax produce f32. Sum preserves numeric dtype, while bool sum produces u32. f16 matmul, reductions, and softmax accumulate internally in f32. These rules do not aim to reproduce every NumPy or PyTorch promotion rule.
 
@@ -155,7 +157,17 @@ const withJvp = customJvp(square, { jvp: tangent });
 
 JVP arguments are `(...inputs, ...inputTangents)`. Its output must match the original output shape. The implementation conservatively checks homogeneous linearity in the tangent, then transposes that linear map for reverse-mode differentiation. Generated derivatives must be compiled before execution.
 
-Keep training parameters on the GPU with `backend.upload(tensor)` and update them with `backend.sgd(parameters, gradients, learningRate)`. Gradients need not be read on the CPU. The MNIST example normalizes data and prepares batches on the CPU, performs forward/backward computation and parameter updates on the GPU, and reads scalar loss for logging.
+Keep training parameters on the GPU with `await backend.copyFrom(tensor)`. `copyFrom` preserves shape and dtype and always returns independent storage owned by the destination backend, leaving the source intact. Host inputs are copied to the device; copies within the same backend stay on the GPU. Other backends currently use a host snapshot as an intermediate. The Promise resolves after copying has been submitted, without waiting for GPU completion; `read()` or `item()` waits when host values are needed.
+
+SGD belongs to the common runtime and uses tensor IR in the parameters' environment:
+
+```ts
+import { sgd } from 'blaten';
+const optimizer = sgd(parameters, { learningRate: 0.1 });
+optimizer.step(gradients);
+```
+
+Parameters and gradients must share an environment, shape, and floating dtype. Updates mutate parameter storage without reading GPU gradients on the CPU. The MNIST example normalizes data and prepares batches on the CPU, performs forward/backward computation and parameter updates on the GPU, and reads scalar loss for logging.
 
 ## Function types and compilation
 
@@ -163,7 +175,7 @@ Shape is the first type parameter: `Tensor<S = Shape, D = DType>`. You can write
 
 The build plugin extracts input signatures from TypeScript parameter types, resolving imported aliases and `typeof` dtype constants. Numbers lower to f32, booleans to bool, and bigints to i64. Tensor inputs need fixed shape tuples and a single concrete dtype to compile directly.
 
-`compile(fn, backend)` takes no separate signature argument. Missing or nonconcrete input signatures cause a runtime error. A generic helper can still be called inside a concretely typed entry point. Output shapes and dtypes are inferred from tensor IR; return-type annotations are not enforced as output constraints.
+`compile(fn, backend)` uses a concrete extracted signature. For unknown dimensions or dtype unions, use `compile(fn, backend, { inputs: [...] })`. Compilation derives actual shapes and dtypes and validates them against declared constraints, including fixed dimensions. Untyped or unsupported parameter types still produce a runtime error. Example inputs supply types; their tensor values are not captured. Output shapes and dtypes are inferred from tensor IR; return-type annotations are not enforced as output constraints.
 
 ```ts
 function genericSum(x: Tensor) {
@@ -175,23 +187,25 @@ function sum784(x: Tensor<[784], typeof f32>) {
   return genericSum(x);
 }
 const program = await compile(sum784, backend);
-// compile(genericSum, backend) rejects: no concrete input signature.
+const specialized = await compile(genericSum, backend, {
+  inputs: [tensor([1, 2, 3])],
+});
 ```
 
-Automatic specialization from actual inputs and dynamic-shape execution are not implemented. A compiled program accepts only its fixed shapes and dtypes.
+A compiled program accepts only its specialized shapes and dtypes. Compile another program for another shape; automatic recompilation and a single program with dynamic shapes are not implemented.
 
 ## IR and backend boundaries
 
 ```text
 TypeScript + 'use kernel'
-  -> @blaten/compiler/vite: AST -> kernel IR, TS types -> input signature
-  -> compile: kernel IR + attached signature -> shape-resolved tensor IR
+  -> @blaten/compiler/vite: AST -> kernel IR, TS types -> input constraints/signature
+  -> compile: kernel IR + constraints + optional example inputs -> tensor IR
   -> grad / custom rules: differentiation of tensor IR
   -> TypeGPU backend: fusion, execution planning, tinyest generation
   -> TypeGPU: WGSL generation, resource binding, WebGPU pipelines
 ```
 
-Build tooling consumes application ASTs. Metadata v2 holds kernel IR, an input signature or extraction-failure reason, and external-reference getters; it contains neither source text nor compiler AST/type objects. Automatic differentiation works on shape-resolved tensor IR.
+Build tooling consumes application ASTs. Metadata v2 holds kernel IR, input constraints, an optional concrete signature or extraction-failure reason, and external-reference getters; it contains neither source text nor compiler AST/type objects. Automatic differentiation works on shape-resolved tensor IR. Captured host tensors become compile-time constant snapshots; pass device tensors as explicit inputs.
 
 Application functions are not registered with TypeGPU. Only generated compute functions' tinyest ASTs are passed to TypeGPU. This connection is isolated in [adapter.ts](packages/typegpu/src/adapter.ts), using the private `__TYPEGPU_META__` v2 contract. The peer range is **~0.12.7** and tinyest is pinned to **0.3.4**. Revalidate that contract before widening compatibility to TypeGPU 0.13.0 or later.
 

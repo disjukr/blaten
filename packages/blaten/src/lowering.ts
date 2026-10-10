@@ -1,5 +1,6 @@
 import { definitionOf, type KernelFunction } from './kernel.js';
 import type { KernelInstruction } from './kernel-ir.js';
+import { Tensor, hostData } from './tensor.js';
 import { getIntrinsic, toNode, type Intrinsic } from './intrinsics.js';
 import * as ir from './ir.js';
 import { shapeOf, dtypeOf, isFloat, type Signature } from './types.js';
@@ -72,7 +73,13 @@ function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[]): any {
       case 'external': {
         const getter = metadata.externals[a.name];
         if (!getter) throw new Error(`Missing kernel external ${a.name}`);
-        return getter();
+        const value = getter();
+        // Captured host tensors are constants, snapshotted at compilation.
+        if (value instanceof Tensor) {
+          const tensor: Tensor = value;
+          return boxed(ir.node('constant', [], tensor.shape, { data: hostData(tensor).slice() }, tensor.dtype));
+        }
+        return value;
       }
       case 'literal': return a.value;
       case 'bigint': return BigInt(a.value);

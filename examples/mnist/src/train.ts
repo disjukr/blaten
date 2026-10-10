@@ -2,10 +2,9 @@ import { f32 } from 'blaten';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { create, globals } from 'webgpu';
-import { compile, randn, zeros, valueAndGrad, type Tensor, type Shape } from 'blaten';
-import { typegpu } from '@blaten/typegpu';
-import { hiddenSize } from './model.js';
-import { batchSize as compiledBatchSize, trainingLoss, inference as inferenceKernel } from './kernels.js';
+import { compile, randn, zeros, sgd, valueAndGrad, type Tensor, type Shape } from 'blaten';
+import { typegpu, inspect } from '@blaten/typegpu';
+import { hiddenSize, loss, predict } from './model.js';
 import { load, batch, shuffle } from './data.js';
 const setting = (name: string, fallback: number) => {
   const value = Number(process.env[name] ?? fallback);
@@ -13,9 +12,9 @@ const setting = (name: string, fallback: number) => {
   return value;
 };
 export async function main() {
-  const trainSize = setting('TRAIN_SIZE', 12000), testSize = setting('TEST_SIZE', 2000), epochs = setting('EPOCHS', 3), batchSize = setting('BATCH_SIZE', compiledBatchSize), hidden = setting('HIDDEN', hiddenSize);
+  const trainSize = setting('TRAIN_SIZE', 12000), testSize = setting('TEST_SIZE', 2000), epochs = setting('EPOCHS', 3), batchSize = setting('BATCH_SIZE', 64), hidden = setting('HIDDEN', hiddenSize);
   const learningRate = Number(process.env.LEARNING_RATE ?? 0.1);
-  if (batchSize !== compiledBatchSize || hidden !== hiddenSize) throw new Error('Change batchSize in kernels.ts or hiddenSize in model.ts to compile other sizes.');
+  if (hidden !== hiddenSize) throw new Error('Change hiddenSize in model.ts to compile other model widths.');
   if (!(learningRate > 0) || !Number.isFinite(learningRate)) throw new Error('LEARNING_RATE must be a positive finite number');
   if (trainSize < batchSize) throw new Error('TRAIN_SIZE must be at least BATCH_SIZE');
   const started = performance.now();
@@ -30,10 +29,13 @@ export async function main() {
   const backend = await typegpu({ device });
   try {
     const initialParameters: Tensor<Shape, typeof f32>[] = [randn([784, hidden], { seed: 1, scale: Math.sqrt(2 / 784) }), zeros([hidden]), randn([hidden, 10], { seed: 2, scale: Math.sqrt(2 / hidden) }), zeros([10])];
-    const parameters = initialParameters.map(x => backend.upload(x));
-    const training = await compile(valueAndGrad(trainingLoss, { arg: [2, 3, 4, 5] }), backend);
-    const inference = await compile(inferenceKernel, backend);
-    console.log(`MNIST 784 → ${hidden} → 10 on ${adapter.info.description || adapter.info.device || 'WebGPU'}; ${training.dispatchCount} training dispatches/batch`);
+    const parameters = await Promise.all(initialParameters.map(x => backend.copyFrom(x)));
+    const examples = batch(trainData, Array.from({ length: batchSize }, (_, i) => i), batchSize);
+    const training = await compile(valueAndGrad(loss, { arg: [2, 3, 4, 5] }), backend, { inputs: [...examples, ...parameters] });
+    const inference = await compile(predict, backend, { inputs: [examples[0], ...parameters] });
+    examples.forEach(tensor => tensor.dispose());
+    const optimizer = sgd(parameters, { learningRate });
+    console.log(`MNIST 784 → ${hidden} → 10 on ${adapter.info.description || adapter.info.device || 'WebGPU'}; ${inspect(training).dispatchCount} training dispatches/batch`);
     const evaluate = async () => {
       let correct = 0;
       for (let start = 0; start < testSize; start += batchSize) {
@@ -61,7 +63,7 @@ export async function main() {
       for (let start = 0; start + batchSize <= trainSize; start += batchSize) {
         const [x, y] = batch(trainData, indices.slice(start, start + batchSize), batchSize);
         const [value, ...gradients] = training.run(x, y, ...parameters) as Tensor<Shape, typeof f32>[];
-        backend.sgd(parameters, gradients, learningRate);
+        optimizer.step(gradients);
         totalLoss += await value!.item(); batches++;
         value!.dispose(); gradients.forEach(g => g.dispose()); x.dispose(); y.dispose();
       }
@@ -70,7 +72,7 @@ export async function main() {
       history.push({ epoch, loss: averageLoss, accuracy });
       console.log(`Epoch ${epoch}/${epochs}: loss=${averageLoss.toFixed(4)}, test accuracy=${(accuracy * 100).toFixed(2)}%`);
     }
-    await device.queue.onSubmittedWorkDone();
+    await backend.synchronize();
     if (gpuErrors.length) throw new Error(gpuErrors.join('\n'));
     const result = {
       verifiedAt: new Date().toISOString(), dataset: 'MNIST (CVDF IDX)', backend: 'typegpu', typegpuVersion: createRequire(import.meta.url)('typegpu/package.json').version,

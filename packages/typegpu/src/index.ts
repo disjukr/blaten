@@ -1,8 +1,14 @@
 import tgpu, { type TgpuRoot, type TgpuComputePipeline } from 'typegpu';
 import * as d from 'typegpu/data';
 import { Tensor, type Shape, type DType, type HostStorage, type Scalar } from 'blaten';
-import { lower, signatureOf, topological, sizeOf, isHostStorage, isFloat, makeStorage, type Node, type KernelFunction, type Backend, type Executable } from 'blaten/backend';
+import { lower, signatureOf, topological, sizeOf, isHostStorage, isFloat, makeStorage, type Node, type KernelFunction, type Backend, type Executable, type Program, type CompileOptions, type TensorOrScalar, storageOf, hostData, deviceStorageOf, registerEnvironment } from 'blaten/backend';
 import * as ast from './adapter.js';
+const diagnostics = new WeakMap<Executable, { readonly dispatchCount: number; readonly workspaceBytes: number }>();
+export function inspect(executable: Executable) {
+  const result = diagnostics.get(executable);
+  if (!result) throw new Error('Executable was not created by the TypeGPU backend');
+  return result;
+}
 type Buffer = ReturnType<TgpuRoot['createBuffer']>;
 const sameShape = (a: Shape, b: Shape) => String(a) === String(b);
 const storageType = (dtype: DType) => dtype === 'bool' || dtype.startsWith('u') ? 'u32' : dtype.startsWith('i') ? 'i32' : dtype;
@@ -29,14 +35,27 @@ export class TypeGpuBackend implements Backend {
   private destroyed = false;
   private readonly executables = new Set<Executable>();
   private readonly tensors = new Set<Tensor<Shape, DType>>();
-  private readonly updates = new Map<Tensor<Shape, DType>, { gradient: Buffer; pipeline: TgpuComputePipeline; rate: number }>();
-  constructor(readonly root: TgpuRoot, private readonly ownsDevice = false) {}
+
+  private readonly workspace = new Map<string, Buffer[]>();
+  private cachedBytes = 0;
+  private readonly directPlans = new Map<string, Executable>();
+  constructor(readonly root: TgpuRoot, private readonly ownsDevice = false) {
+    registerEnvironment(this, {
+      execute: (program, inputs) => this.executeDirect(program, inputs),
+      assign: (target, source) => {
+        this.assertAlive();
+        const encoder = this.root.device.createCommandEncoder();
+        encoder.copyBufferToBuffer((deviceStorageOf(source).buffer as Buffer).buffer, 0, (deviceStorageOf(target).buffer as Buffer).buffer, 0, gpuBytes(source.size, source.dtype));
+        this.root.device.queue.submit([encoder.finish()]);
+      },
+    });
+  }
   private assertAlive() { if (this.destroyed) throw new Error('Backend is disposed') }
-  get supportedDTypes(): readonly DType[] {
-    return ['bool', 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'f32', ...(this.root.device.features.has('shader-f16') ? ['f16' as const] : [])];
+  get capabilities(): Backend['capabilities'] {
+    return { dtypes: ['bool', 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'f32', ...(this.root.device.features.has('shader-f16') ? ['f16' as const] : [])] };
   }
   private assertDType(dtype: DType) {
-    if (!this.supportedDTypes.includes(dtype)) throw new Error(`TypeGPU backend does not support ${dtype}${dtype === 'f16' ? ': device requires shader-f16' : ''}`);
+    if (!this.capabilities.dtypes.includes(dtype)) throw new Error(`TypeGPU backend does not support ${dtype}${dtype === 'f16' ? ': device requires shader-f16' : ''}`);
   }
   private write(buffer: Buffer, values: HostStorage, dtype: DType): void {
     const packed = storageType(dtype) === dtype ? values : makeStorage(storageType(dtype) as DType, Array.from(values as any) as Scalar[]);
@@ -58,28 +77,72 @@ export class TypeGpuBackend implements Backend {
       read: async () => { this.assertAlive(); return makeStorage(dtype, (await buffer.read() as number[]).slice(0, sizeOf(shape))) },
       dispose: () => {
         buffer.destroy(); this.tensors.delete(result);
-        this.updates.get(result)?.gradient.destroy(); this.updates.delete(result);
       },
     }, shape, dtype);
     this.tensors.add(result); return result;
   }
-  upload<S extends Shape, D extends DType>(value: Tensor<S, D>): Tensor<S, D> {
+  async copyFrom<S extends Shape, D extends DType>(value: Tensor<S, D>): Promise<Tensor<S, D>> {
     this.assertAlive(); value.assertAlive();
     this.assertDType(value.dtype);
-    if (!isHostStorage(value.storage)) {
-      if (value.storage.owner !== this) throw new Error('Tensor belongs to a different backend');
-      return value;
+    if (isHostStorage(storageOf(value))) {
+      return this.deviceTensor(this.buffer(value.shape, value.dtype, hostData(value)), value.shape, value.dtype);
     }
-    return this.deviceTensor(this.buffer(value.shape, value.dtype, value.data), value.shape, value.dtype);
+    if (deviceStorageOf(value).owner === this) {
+      const buffer = this.buffer(value.shape, value.dtype);
+      try {
+        const encoder = this.root.device.createCommandEncoder();
+        encoder.copyBufferToBuffer((deviceStorageOf(value).buffer as Buffer).buffer, 0, buffer.buffer, 0, gpuBytes(value.size, value.dtype));
+        this.root.device.queue.submit([encoder.finish()]);
+        return this.deviceTensor(buffer, value.shape, value.dtype);
+      } catch (error) { buffer.destroy(); throw error }
+    }
+    // Other environments provide a host snapshot; no knowledge of their buffer
+    // representation is required. Recheck lifetime after the asynchronous read.
+    const data = await value.read();
+    this.assertAlive(); value.assertAlive();
+    return this.deviceTensor(this.buffer(value.shape, value.dtype, data), value.shape, value.dtype);
   }
-  async compile(fn: KernelFunction): Promise<Executable> {
+  async compile(fn: KernelFunction, options?: CompileOptions): Promise<Executable> {
     this.assertAlive();
-    const program = lower(fn, signatureOf(fn));
+    return this.compileProgram(lower(fn, signatureOf(fn, options?.inputs)));
+  }
+  async synchronize(): Promise<void> {
+    this.assertAlive(); await this.root.device.queue.onSubmittedWorkDone();
+  }
+  private acquireWorkspace(shape: Shape, dtype: DType): Buffer {
+    const key = dtype + ':' + sizeOf(shape), free = this.workspace.get(key), buffer = free?.pop();
+    if (buffer) { if (!free!.length) this.workspace.delete(key); this.cachedBytes -= gpuBytes(sizeOf(shape), dtype); return buffer }
+    return this.buffer(shape, dtype);
+  }
+  private releaseWorkspace(buffer: Buffer, shape: Shape, dtype: DType): void {
+    const bytes = gpuBytes(sizeOf(shape), dtype);
+    if (this.destroyed || this.cachedBytes + bytes > 64 * 1024 * 1024) { buffer.destroy(); return }
+    const key = dtype + ':' + sizeOf(shape), free = this.workspace.get(key) ?? [];
+    free.push(buffer); this.workspace.set(key, free); this.cachedBytes += bytes;
+  }
+  private executeDirect(program: Program, inputs: readonly TensorOrScalar[]): Tensor | Tensor[] {
+    this.assertAlive();
+    const nodes = topological(program.outputs), indexes = new Map(nodes.map((node, index) => [node, index]));
+    const key = JSON.stringify([program.single, program.inputs.map(node => indexes.get(node)), nodes.map(node => [node.op, node.shape, node.dtype, node.inputs.map(input => indexes.get(input)), Object.fromEntries(Object.entries(node.attrs).filter(([name]) => name !== 'tensor'))])], (_, value) => typeof value === 'bigint' ? 'bigint:' + value : typeof value === 'number' && !Number.isFinite(value) ? String(value) : value);
+    // Plans bind inputs on each run; do not retain the first caller's tensors.
+    nodes.forEach(node => { delete node.attrs.tensor });
+    let executable = this.directPlans.get(key);
+    if (!executable) {
+      executable = this.compileProgram(program);
+      if (this.directPlans.size >= 32) {
+        const oldest = this.directPlans.keys().next().value!;
+        this.directPlans.get(oldest)!.dispose(); this.directPlans.delete(oldest);
+      }
+    }
+    this.directPlans.delete(key); this.directPlans.set(key, executable);
+    return executable.run(...inputs);
+  }
+  private compileProgram(program: Program): Executable {
     const order = topological(program.outputs);
     [...program.inputs, ...order].forEach(n => this.assertDType(n.dtype));
     const buffers = new Map<Node, Buffer>();
     const steps: { pipeline: TgpuComputePipeline; count: number }[] = [];
-    const allocate = (n: Node, data?: HostStorage) => { const b = this.buffer(n.shape, n.dtype, data); buffers.set(n, b); return b };
+    const allocate = (n: Node, data?: HostStorage) => { const b = this.acquireWorkspace(n.shape, n.dtype); buffers.set(n, b); if (data) this.write(b, data, n.dtype); return b };
     // Materialize expensive operations and outputs; fuse elementwise/view IR into their consumers.
     const boundaries = new Set(['matmul', 'sum', 'softmax', 'logsoftmax']);
     try {
@@ -173,12 +236,11 @@ export class TypeGpuBackend implements Backend {
         body.push([11, ast.binary('index', '<', ast.uint(count)), ast.block(work)]);
         if (Math.ceil(count / 64) > this.root.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('Tensor exceeds device dispatch limits');
         const pipeline = ast.pipeline(this.root, `blaten_${n.op}_${n.id}`, body, resources);
-        await pipeline.initAsync(); steps.push({ pipeline, count });
+        pipeline.initSync(); steps.push({ pipeline, count });
       }
     } catch (error) { for (const b of buffers.values()) b.destroy(); throw error }
     let disposed = false;
     const executable: Executable = {
-      dispatchCount: steps.length,
       run: (...inputs) => {
         this.assertAlive(); if (disposed) throw new Error('Executable is disposed');
         if (inputs.length !== program.inputs.length) throw new Error('Input count does not match signature');
@@ -194,7 +256,7 @@ export class TypeGpuBackend implements Backend {
           value.assertAlive();
           if (!sameShape(value.shape, expected)) throw new Error(`Input ${i}: expected [${expected}], received [${value.shape}]`);
           if (value.dtype !== dtype) throw new Error(`Input ${i}: expected dtype ${dtype}, received ${value.dtype}`);
-          if (!isHostStorage(value.storage) && value.storage.owner !== this) throw new Error('Tensor belongs to a different backend');
+          if (!isHostStorage(storageOf(value)) && deviceStorageOf(value).owner !== this) throw new Error('Tensor belongs to a different backend');
           return value;
         });
         const encoder = this.root.device.createCommandEncoder();
@@ -202,8 +264,8 @@ export class TypeGpuBackend implements Backend {
           const buffer = buffers.get(program.inputs[i]!)!;
           const dtype = program.inputs[i]!.dtype;
           if (typeof value !== 'object') this.write(buffer, makeStorage(dtype, [value]), dtype);
-          else if (isHostStorage(value.storage)) this.write(buffer, value.storage, dtype);
-          else encoder.copyBufferToBuffer((value.storage.buffer as Buffer).buffer, 0, buffer.buffer, 0, gpuBytes(value.size, dtype));
+          else if (isHostStorage(storageOf(value))) this.write(buffer, hostData(value), dtype);
+          else encoder.copyBufferToBuffer((deviceStorageOf(value).buffer as Buffer).buffer, 0, buffer.buffer, 0, gpuBytes(value.size, dtype));
         });
         for (const step of steps) step.pipeline.with(encoder).dispatchWorkgroups(Math.ceil(step.count / 64));
         const results = program.outputs.map(n => {
@@ -214,39 +276,16 @@ export class TypeGpuBackend implements Backend {
         this.root.device.queue.submit([encoder.finish()]);
         return program.single ? results[0]! : results;
       },
-      dispose: () => { if (disposed) return; disposed = true; for (const b of buffers.values()) b.destroy(); this.executables.delete(executable) },
+      dispose: () => { if (disposed) return; disposed = true; for (const [node, buffer] of buffers) this.releaseWorkspace(buffer, node.shape, node.dtype); this.executables.delete(executable) },
     };
+    diagnostics.set(executable, Object.freeze({ dispatchCount: steps.length, workspaceBytes: [...buffers.keys()].reduce((sum, node) => sum + gpuBytes(sizeOf(node.shape), node.dtype), 0) }));
     this.executables.add(executable); return executable;
-  }
-  // Parameters and gradients remain on device. One submission updates all parameters.
-  sgd(parameters: readonly Tensor<Shape, DType>[], gradients: readonly Tensor<Shape, DType>[], learningRate: number): void {
-    this.assertAlive();
-    if (parameters.length !== gradients.length || !(learningRate > 0) || !Number.isFinite(learningRate)) throw new Error('Invalid SGD arguments');
-    parameters.forEach((p, i) => {
-      const g = gradients[i]!; p.assertAlive(); g.assertAlive();
-      if (isHostStorage(p.storage) || isHostStorage(g.storage) || p.storage.owner !== this || g.storage.owner !== this || !sameShape(p.shape, g.shape) || p.dtype !== g.dtype || !isFloat(p.dtype)) throw new Error('SGD requires matching floating device tensors owned by this backend');
-    });
-    const encoder = this.root.device.createCommandEncoder();
-    parameters.forEach((p, i) => {
-      const g = gradients[i]!;
-      let update = this.updates.get(p);
-      if (!update || update.rate !== learningRate) {
-        update?.gradient.destroy();
-        const gradient = this.buffer(p.shape, p.dtype);
-        const pipeline = ast.pipeline(this.root, 'blaten_sgd', [[13, 'index', ast.index], [11, ast.binary('index', '<', ast.uint(p.size)), ast.block([
-          ast.assign(ast.at('parameter', 'index'), ast.binary(ast.at('parameter', 'index'), '-', ast.binary(ast.scalar(p.dtype, ast.num(learningRate)), '*', ast.at('gradient', 'index')))),
-        ])]], { parameter: (p.storage as any).buffer.as('mutable'), gradient: (gradient as any).as('readonly') });
-        pipeline.initSync(); update = { gradient, pipeline, rate: learningRate }; this.updates.set(p, update);
-      }
-      encoder.copyBufferToBuffer((g.storage as any).buffer.buffer, 0, update.gradient.buffer, 0, gpuBytes(g.size, g.dtype));
-      update.pipeline.with(encoder).dispatchWorkgroups(Math.ceil(p.size / 64));
-    });
-    this.root.device.queue.submit([encoder.finish()]);
   }
   dispose(): void {
     if (this.destroyed) return;
     this.executables.forEach(e => e.dispose()); this.tensors.forEach(t => t.dispose());
-    this.updates.forEach(u => u.gradient.destroy()); this.updates.clear();
+    this.directPlans.clear();
+    this.workspace.forEach(buffers => buffers.forEach(buffer => buffer.destroy())); this.workspace.clear(); this.cachedBytes = 0;
     this.root.destroy(); if (this.ownsDevice) this.root.device.destroy(); this.destroyed = true;
   }
 }

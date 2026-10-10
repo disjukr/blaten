@@ -1,5 +1,7 @@
 import type { KernelIR } from './kernel-ir.js';
-import { dtypeOf, type Signature } from './types.js';
+import { dtypeOf, scalarDType, tensorType, type Signature, type SignatureConstraints } from './types.js';
+import { Tensor } from './tensor.js';
+import type { TensorOrScalar } from './runtime.js';
 export type KernelFunction = (...args: any[]) => any;
 export interface KernelMetadata {
   version: 2;
@@ -8,6 +10,7 @@ export interface KernelMetadata {
   externals: Record<string, () => unknown>;
   signature?: Signature;
   signatureError?: string;
+  constraints?: SignatureConstraints;
 }
 export type Definition =
   | { kind: 'kernel'; metadata: KernelMetadata }
@@ -38,7 +41,7 @@ export function definitionOf(fn: KernelFunction): Definition {
   return definition;
 }
 /** Derivatives and custom differentiation rules retain their source's input signature. */
-export function signatureOf(fn: KernelFunction): Signature {
+export function signatureOf(fn: KernelFunction, inputs?: readonly TensorOrScalar[]): Signature {
   const seen = new Set<KernelFunction>();
   while (true) {
     if (seen.has(fn)) throw new Error('Cyclic kernel signature definition');
@@ -46,7 +49,24 @@ export function signatureOf(fn: KernelFunction): Signature {
     const definition = definitionOf(fn);
     if (definition.kind !== 'kernel') { fn = definition.source; continue }
     const { metadata } = definition;
-    if (!metadata.signature) throw new Error(`Cannot compile ${metadata.name}: ${metadata.signatureError ?? 'concrete input signature is missing'}. Wrap the kernel in a function with concrete shape and dtype annotations.`);
+    if (inputs) {
+      if (inputs.length !== metadata.ir.parameterCount) throw new Error('Kernel signature input count does not match IR');
+      const constraints = metadata.constraints?.inputs ?? metadata.signature?.inputs.map(type => typeof type === 'string' ? type : ({ kind: 'tensor' as const, shape: type.shape, dtypes: [type.dtype] }));
+      if (!constraints) throw new Error(`Cannot compile ${metadata.name}: ${metadata.signatureError ?? 'input type constraints are missing'}`);
+      return { inputs: inputs.map((input, index) => {
+        const constraint = constraints[index]!;
+        if (typeof constraint === 'string') {
+          if (input instanceof Tensor || scalarDType(input) !== constraint) throw new Error(`Input ${index}: expected scalar ${constraint}`);
+          return constraint;
+        }
+        if (!(input instanceof Tensor)) throw new Error(`Input ${index}: expected a tensor`);
+        input.assertAlive();
+        if (!constraint.dtypes.includes(input.dtype)) throw new Error(`Input ${index}: expected dtype ${constraint.dtypes.join(' | ')}, received ${input.dtype}`);
+        if (constraint.shape && (constraint.shape.length !== input.rank || constraint.shape.some((dim, axis) => dim !== null && dim !== input.shape[axis]))) throw new Error(`Input ${index}: expected shape [${constraint.shape.map(dim => dim ?? 'number')}], received [${input.shape}]`);
+        return tensorType(input.shape, input.dtype);
+      }) };
+    }
+    if (!metadata.signature) throw new Error(`Cannot compile ${metadata.name}: ${metadata.signatureError ?? 'concrete input signature is missing'}. Supply options.inputs or concrete shape and dtype annotations.`);
     if (metadata.signature.inputs.length !== metadata.ir.parameterCount) throw new Error('Kernel signature input count does not match IR');
     metadata.signature.inputs.forEach(dtypeOf);
     return metadata.signature;
