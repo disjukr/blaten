@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { sgd, tensor, valueAndGrad, gradientAccumulator, type Executable, type Tensor } from 'blaten';
+import { sgd, tensor, valueAndGrad, gradientAccumulator, type Executable, type TensorF32 } from 'blaten';
 import { inspect, type TypeGpuBackend } from '@blaten/typegpu';
 import { hiddenSize, initParameters, loss, predict, type Parameters } from './model.js';
 import { load, batches, type Dataset } from './data.js';
@@ -54,7 +54,7 @@ export async function main() {
     console.log(`Before training: ${(initialAccuracy * 100).toFixed(2)}% test accuracy`);
     try {
       for (let epoch = 1; epoch <= epochs; epoch++) {
-        let totalLoss: Tensor = await backend.scope(() => backend.copyFrom(tensor(0, { shape: [] })));
+        let totalLoss: TensorF32 = await backend.scope(() => backend.copyFrom(tensor(0, { shape: [] })));
         let count = 0;
         try {
           for (const batch of batches(trainData, { size: trainSize, batchSize, shuffleSeed: 100 + epoch, dropLast: true })) {

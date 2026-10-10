@@ -3,7 +3,8 @@ import { execute } from './execution.js';
 import * as ir from './ir.js';
 import { mapKernel } from './lowering.js';
 import { kernelIr } from './kernel.js';
-import { sizeOf, f32, bool, isFloat, isInteger, makeStorage, convertScalar, type DType, type FloatDType, type HostStorage, type Scalar, type ScalarOf, type Shape } from './types.js';
+import { sizeOf, f32, bool, isInteger, makeStorage, convertScalar, type DType, type HostStorage, type Scalar, type ScalarOf, type Shape } from './types.js';
+import type { Operand, OperandShape, BinaryDType, Broadcast, Floating, Summed, MatmulShape, Transposed, Reduced, Promote } from './tensor-types.js';
 type Value = Tensor<Shape, DType> | Scalar;
 export interface Intrinsic {
   readonly name: string;
@@ -136,60 +137,63 @@ function finish(n: ir.Node, inputs: readonly unknown[]): any {
   if (inputs.every(x => typeof x === 'number' || typeof x === 'bigint' || typeof x === 'boolean') && n.shape.length === 0) return n.dtype === bool ? Boolean(values[0]) : values[0];
   return new Tensor(values, n.shape, n.dtype);
 }
-interface BinaryOperation {
+interface BinaryOperation<Divide extends boolean = false> {
   (a: number, b: number): number;
   (a: bigint, b: bigint): Scalar;
-  <D extends FloatDType>(a: Tensor<Shape, D>, b: Tensor<Shape, D> | Scalar): Tensor<Shape, D>;
-  <D extends FloatDType>(a: Scalar, b: Tensor<Shape, D>): Tensor<Shape, D>;
-  (a: Tensor<Shape, DType>, b: Value): Tensor<Shape, DType>;
-  (a: Value, b: Tensor<Shape, DType>): Tensor<Shape, DType>;
+  <S extends Shape, D extends DType, X extends Operand>(a: Tensor<S, D>, b: X): Tensor<Broadcast<S, OperandShape<X>>, Divide extends true ? Floating<BinaryDType<Tensor<S, D>, X>> : BinaryDType<Tensor<S, D>, X>>;
+  <X extends Scalar, S extends Shape, D extends DType>(a: X, b: Tensor<S, D>): Tensor<S, Divide extends true ? Floating<BinaryDType<X, Tensor<S, D>>> : BinaryDType<X, Tensor<S, D>>>;
 }
-interface UnaryOperation { (x: number): number; <D extends FloatDType>(x: Tensor<Shape, D>): Tensor<Shape, D>; (x: Tensor<Shape, DType>): Tensor<Shape, DType> }
-const binary = (op: 'add' | 'sub' | 'mul' | 'div'): BinaryOperation => (a: Value, b: Value): any => finish(ir.binary(op, toNode(a), toNode(b)), [a, b]);
-const unary = (op: 'neg' | 'exp' | 'log' | 'tanh' | 'relu'): UnaryOperation => (x: Value): any => finish(ir.unary(op, toNode(x)), [x]);
+interface UnaryOperation<Float extends boolean = false> {
+  (x: number): number;
+  <S extends Shape, D extends DType>(x: Tensor<S, D>): Tensor<S, Float extends true ? Floating<D> : D>;
+}
+const binary = <O extends 'add' | 'sub' | 'mul' | 'div'>(op: O): BinaryOperation<O extends 'div' ? true : false> => (a: Value, b: Value): any => finish(ir.binary(op, toNode(a), toNode(b)), [a, b]);
+const unary = <O extends 'neg' | 'exp' | 'log' | 'tanh' | 'relu'>(op: O): UnaryOperation<O extends 'exp' | 'log' | 'tanh' ? true : false> => (x: Value): any => finish(ir.unary(op, toNode(x)), [x]);
 export const add = register('add', binary('add'));
 export const sub = register('sub', binary('sub'));
 export const mul = register('mul', binary('mul'));
 export const div = register('div', binary('div'));
-export const gt = register('gt', (a: Value, b: Value): any => finish(ir.binary('gt', toNode(a), toNode(b)), [a, b]));
-export const and = register('and', (a: Value, b: Value): any => finish(ir.logical('and', toNode(a), toNode(b)), [a, b]));
-export const or = register('or', (a: Value, b: Value): any => finish(ir.logical('or', toNode(a), toNode(b)), [a, b]));
-export const not = register('not', (x: Value): any => finish(ir.logical('not', toNode(x)), [x]));
-export const cast = register('cast', <D extends DType>(x: Tensor<Shape, DType>, dtype: D): Tensor<Shape, D> => finish(ir.cast(toNode(x), dtype), [x]));
+interface ComparisonOperation {
+  (a: Scalar, b: Scalar): boolean;
+  <S extends Shape, D extends DType, X extends Operand>(a: Tensor<S, D>, b: X): Tensor<Broadcast<S, OperandShape<X>>, typeof bool>;
+  <X extends Scalar, S extends Shape, D extends DType>(a: X, b: Tensor<S, D>): Tensor<S, typeof bool>;
+}
+export const gt = register('gt', ((a: Value, b: Value): any => finish(ir.binary('gt', toNode(a), toNode(b)), [a, b])) as ComparisonOperation);
+export const and = register('and', ((a: Value, b: Value): any => finish(ir.logical('and', toNode(a), toNode(b)), [a, b])) as ComparisonOperation);
+export const or = register('or', ((a: Value, b: Value): any => finish(ir.logical('or', toNode(a), toNode(b)), [a, b])) as ComparisonOperation);
+interface NotOperation { (x: boolean): boolean; <S extends Shape>(x: Tensor<S>): Tensor<S, typeof bool> }
+export const not = register('not', ((x: Value): any => finish(ir.logical('not', toNode(x)), [x])) as NotOperation);
+export const cast = register('cast', <S extends Shape, D extends DType>(x: Tensor<S, DType>, dtype: D): Tensor<S, D> => finish(ir.cast(toNode(x), dtype), [x]));
 export const neg = register('neg', unary('neg'));
 export const exp = register('exp', unary('exp'));
 export const log = register('log', unary('log'));
 export const tanh = register('tanh', unary('tanh'));
 export const relu = register('relu', unary('relu'));
-interface MatmulOperation {
-  <D extends FloatDType>(a: Tensor<Shape, D>, b: Tensor<Shape, D>): Tensor<Shape, D>;
-  (a: Tensor<Shape, DType>, b: Tensor<Shape, DType>): Tensor<Shape, DType>;
-}
-export const matmul = register('matmul', ((a: Tensor<Shape, DType>, b: Tensor<Shape, DType>): Tensor<Shape, DType> => finish(ir.matmul(toNode(a), toNode(b)), [a, b])) as MatmulOperation);
-export const transpose = register('transpose', (x: Tensor<Shape, DType>): Tensor<Shape, DType> => finish(ir.transpose(toNode(x)), [x]));
-export const reshape = register('reshape', (x: Tensor<Shape, DType>, shape: Shape): Tensor<Shape, DType> => finish(ir.reshape(toNode(x), shape), [x]));
-export const sum = register('sum', <D extends DType>(x: Tensor<Shape, D>, axis?: number | readonly number[], keepDims = false): Tensor<Shape, D extends 'bool' ? 'u32' : D> => finish(ir.reduce(toNode(x), axis, keepDims), [x]));
-export const mean = register('mean', (x: Tensor<Shape, DType>, axis?: number | readonly number[], keepDims = false): Tensor<Shape, DType> => {
+export const matmul = register('matmul', <A extends Shape, B extends Shape, D extends DType, E extends DType>(a: Tensor<A, D>, b: Tensor<B, E>): Tensor<MatmulShape<A, B>, Promote<D, E>> => finish(ir.matmul(toNode(a), toNode(b)), [a, b]));
+export const transpose = register('transpose', <S extends Shape, D extends DType>(x: Tensor<S, D>): Tensor<Transposed<S>, D> => finish(ir.transpose(toNode(x)), [x]));
+export const reshape = register('reshape', <S extends Shape, D extends DType, const R extends Shape>(x: Tensor<S, D>, shape: R): Tensor<R, D> => finish(ir.reshape(toNode(x), shape), [x]));
+export const sum = register('sum', <S extends Shape, D extends DType, const A extends number | readonly number[] | undefined = undefined, K extends boolean = false>(x: Tensor<S, D>, axis?: A, keepDims?: K): Tensor<Reduced<S, A, K>, Summed<D>> => finish(ir.reduce(toNode(x), axis, keepDims), [x]));
+export const mean = register('mean', <S extends Shape, D extends DType, const A extends number | readonly number[] | undefined = undefined, K extends boolean = false>(x: Tensor<S, D>, axis?: A, keepDims?: K): Tensor<Reduced<S, A, K>, Floating<D>> => {
   const input = toNode(x), reduced = ir.reduce(input, axis, keepDims);
   return finish(ir.binary('div', reduced, ir.constant(sizeOf(input.shape) / sizeOf(reduced.shape))), [x]);
 });
-export const softmax = register('softmax', (x: Tensor<Shape, DType>): Tensor<Shape, DType> => {
+export const softmax = register('softmax', <S extends Shape, D extends DType>(x: Tensor<S, D>): Tensor<S, Floating<D>> => {
   const input = ir.floating(toNode(x));
   if (!input.shape.length) throw new Error('softmax requires at least one axis');
   return finish(ir.node('softmax', [input], input.shape), [x]);
 });
-export const crossEntropy = register('crossEntropy', <D extends DType>(logits: Tensor<Shape, D>, targets: Tensor<Shape, DType>): Tensor<Shape, D extends FloatDType ? D : typeof f32> => {
+export const crossEntropy = register('crossEntropy', <D extends DType>(logits: Tensor<Shape, D>, targets: Tensor<Shape, DType>): Tensor<readonly [], Floating<D>> => {
   const a = ir.floating(toNode(logits)), b = ir.cast(toNode(targets), a.dtype);
   if (a.shape.length !== 2 || String(a.shape) !== String(b.shape)) throw new Error('crossEntropy expects [batch, classes] logits and one-hot targets');
   const logs = ir.node('logsoftmax', [a], a.shape);
   return finish(ir.binary('div', ir.unary('neg', ir.reduce(ir.binary('mul', logs, b))), ir.constant(a.shape[0]!)), [logits, targets]);
 });
-export const map = register('map', <D extends DType>(fn: (x: ScalarOf<D>) => Scalar, x: Tensor<Shape, D>): Tensor<Shape, DType> => {
+export const map = register('map', <S extends Shape, D extends DType>(fn: (x: ScalarOf<D>) => Scalar, x: Tensor<S, D>): Tensor<S, DType> => {
   if (Object.hasOwn(fn, kernelIr)) {
     const result = mapKernel(fn, toNode(x));
     return finish(result, [x]);
   }
   const values = Array.from(hostData(x) as any, (value: any) => fn((x.dtype === bool ? Boolean(value) : value) as ScalarOf<D>));
   const dtype = values.every(value => typeof value === 'boolean') ? bool : x.dtype === bool ? f32 : x.dtype;
-  return new Tensor<Shape, DType>(makeStorage<DType>(dtype, values), x.shape, dtype);
+  return new Tensor<S, DType>(makeStorage<DType>(dtype, values), x.shape as S, dtype);
 }, [0]);
