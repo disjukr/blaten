@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { tensor, scope, disposeTree, sgd, gradientAccumulator, compileLazy, accumulate, meanMetric, meanAccumulator, zeros } from 'blaten';
+import { tensor, scope, disposeTree, sgd, gradientAccumulator, compileLazy, accumulate, meanMetric, meanAccumulator, multiclassAccuracy, argmax, eq, zeros } from 'blaten';
 import { callable } from 'blaten/backend';
 
 const parameters = { layer: [tensor([10, 20])], bias: tensor([5]) };
@@ -61,6 +61,42 @@ scope(() => {
   assert.deepEqual(pairs.compute().map(value => [...value.shape]), [[1], [1]]);
   assert.throws(() => gradientAccumulator([shared, shared]), /distinct/);
 });
+
+// Arbitrary argmax axes, ties, nonfinite values and exact integer comparisons.
+scope(() => {
+  const scores = tensor([1, 5, 5, -3, -1, -2], { shape: [2, 3] });
+  assert.deepEqual([...argmax(scores, -1).shape], [2]);
+  assert.deepEqual([...scores.argmax(0).shape], [3]);
+  assert.throws(() => scores.argmax(2), /axis/);
+  assert.throws(() => scores.argmax(0.5), /axis/);
+  assert.throws(() => tensor(1, { shape: [] }).argmax(0), /axis/);
+});
+assert.deepEqual([...await scope(() => tensor([1, 5, 5, -3, -1, -2], { shape: [2, 3] }).argmax(-1).read())], [1, 1]);
+assert.deepEqual([...await scope(() => tensor([1, 5, 5, 3, 1, 9], { shape: [2, 3] }).argmax(0).read())], [1, 0, 1]);
+assert.deepEqual([...await scope(() => tensor([0, NaN, NaN, Infinity], { shape: [4] }).argmax(0).read())], [1]);
+assert.deepEqual([...await scope(() => tensor([-Infinity, -Infinity], { shape: [2] }).argmax(0).read())], [0]);
+assert.deepEqual([...await scope(() => tensor([9007199254740992n, 9007199254740993n], { shape: [2] }).argmax(0).read())], [1]);
+assert.deepEqual([...await scope(() => tensor([false, true, true], { shape: [3] }).argmax(0).read())], [1]);
+assert.deepEqual([...await scope(() => eq(tensor([1, 2], { shape: [2, 1] }), tensor([1, 2, 3], { shape: [3] })).read())], [1, 0, 0, 0, 1, 0]);
+assert.equal(eq(true, false), false);
+assert.deepEqual([...await scope(() => tensor([9007199254740992n, 9007199254740993n]).eq(9007199254740993n).read())], [0, 1]);
+{
+  using accuracy = multiclassAccuracy();
+  assert.throws(() => accuracy.compute(), /empty/);
+  scope(() => accuracy.add({ logits: tensor([2, 1, 1, 2, 2, 1], { shape: [3, 2] }), targets: tensor([1, 0, 1, 0, 1, 0], { shape: [3, 2] }), validCount: 2 }));
+  // The final matching padded row must not count: 1/2, not 2/3.
+  assert.equal(await scope(() => accuracy.compute().item()), 0.5);
+  scope(() => accuracy.add({ logits: tensor([2, 1], { shape: [1, 2] }), targets: tensor([1, 0], { shape: [1, 2] }) }));
+  assert.ok(Math.abs(await scope(() => accuracy.compute().item()) - 2 / 3) < 1e-6);
+  assert.equal(accuracy.weight, 3);
+  assert.throws(() => scope(() => accuracy.add({ logits: zeros([1, 2]), targets: zeros([1, 3]) })), /matching/);
+  for (const validCount of [0, -1, 2, 0.5, NaN]) assert.throws(() => scope(() => accuracy.add({ logits: zeros([1, 2]), targets: zeros([1, 2]), validCount })), /validCount/);
+  assert.equal(accuracy.weight, 3);
+  using snapshot = accuracy.compute();
+  accuracy.reset();
+  assert.throws(() => accuracy.compute(), /empty/);
+  assert.ok(Math.abs(await snapshot.item() - 2 / 3) < 1e-6);
+}
 
 // The optimizer wrapper owns buffers but borrows gradients and parameters.
 const wrappedParameters = { weight: tensor([10]), bias: tensor(5, { shape: [] }) };

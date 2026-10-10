@@ -86,6 +86,7 @@ export function evaluateCpu(root: ir.Node, bindings: ReadonlyMap<ir.Node, HostSt
         case 'or': write(i, Boolean(at(x!, a!, i)) || Boolean(at(y!, b!, i))); break;
         case 'not': write(i, !x![i]); break;
         case 'add': case 'sub': case 'mul': case 'div': write(i, arithmetic(n.op, at(x!, a!, i), at(y!, b!, i), n.dtype)); break;
+        case 'eq': out[i] = +(at(x!, a!, i) === at(y!, b!, i)); break;
         case 'gt': out[i] = +(at(x!, a!, i) > at(y!, b!, i)); break;
         case 'neg': write(i, -x![i]!); break;
         case 'exp': write(i, Math.exp(Number(x![i]!))); break;
@@ -105,6 +106,17 @@ export function evaluateCpu(root: ir.Node, bindings: ReadonlyMap<ir.Node, HostSt
           }
           write(i, total); break;
         }
+        case 'argmax': {
+          const axis: number = n.attrs.axis, width = a!.shape[axis]!;
+          const stride = sizeOf(a!.shape.slice(axis + 1));
+          const start = Math.floor(i / stride) * width * stride + i % stride;
+          let best = 0;
+          for (let k = 1; k < width; k++) {
+            const candidate = x![start + k * stride]!, maximum = x![start + best * stride]!;
+            if (candidate > maximum || (Number.isNaN(candidate) && !Number.isNaN(maximum))) best = k;
+          }
+          out[i] = best; break;
+        }
         case 'sum': break;
         case 'softmax': case 'logsoftmax': {
           const width = n.shape.at(-1)!, start = Math.floor(i / width) * width;
@@ -119,7 +131,7 @@ export function evaluateCpu(root: ir.Node, bindings: ReadonlyMap<ir.Node, HostSt
     if (n.op === 'sum') {
       const accumulatorDType = n.dtype === 'f16' ? f32 : n.dtype;
       const accumulated = makeStorage(accumulatorDType, out.length) as any;
-      for (let i = 0; i < x!.length; i++) {
+      for (let i = 0; i < (n.attrs.limit ?? x!.length); i++) {
         const destination = reductionIndex(i, a!.shape, n.attrs.axes, n.attrs.keepDims);
         accumulated[destination] = convertScalar(arithmetic('add', accumulated[destination]!, x![i]!, accumulatorDType), accumulatorDType);
       }
@@ -158,6 +170,7 @@ interface ComparisonOperation {
   <S extends Shape, D extends DType, X extends Operand>(a: Tensor<S, D>, b: X): Tensor<Broadcast<S, OperandShape<X>>, typeof bool>;
   <X extends Scalar, S extends Shape, D extends DType>(a: X, b: Tensor<S, D>): Tensor<S, typeof bool>;
 }
+export const eq = register('eq', ((a: Value, b: Value): any => finish(ir.binary('eq', toNode(a), toNode(b)), [a, b])) as ComparisonOperation);
 export const gt = register('gt', ((a: Value, b: Value): any => finish(ir.binary('gt', toNode(a), toNode(b)), [a, b])) as ComparisonOperation);
 export const and = register('and', ((a: Value, b: Value): any => finish(ir.logical('and', toNode(a), toNode(b)), [a, b])) as ComparisonOperation);
 export const or = register('or', ((a: Value, b: Value): any => finish(ir.logical('or', toNode(a), toNode(b)), [a, b])) as ComparisonOperation);
@@ -170,6 +183,7 @@ export const log = register('log', unary('log'));
 export const tanh = register('tanh', unary('tanh'));
 export const relu = register('relu', unary('relu'));
 export const matmul = register('matmul', <A extends Shape, B extends Shape, D extends DType, E extends DType>(a: Tensor<A, D>, b: Tensor<B, E>): Tensor<MatmulShape<A, B>, Promote<D, E>> => finish(ir.matmul(toNode(a), toNode(b)), [a, b]));
+export const argmax = register('argmax', <S extends Shape, const A extends number>(x: Tensor<S>, axis: A): Tensor<Reduced<S, A, false>, 'i32'> => finish(ir.argmax(toNode(x), axis), [x]));
 export const transpose = register('transpose', <S extends Shape, D extends DType>(x: Tensor<S, D>): Tensor<Transposed<S>, D> => finish(ir.transpose(toNode(x)), [x]));
 export const reshape = register('reshape', <S extends Shape, D extends DType, const R extends Shape>(x: Tensor<S, D>, shape: R): Tensor<R, D> => finish(ir.reshape(toNode(x), shape), [x]));
 export const sum = register('sum', <S extends Shape, D extends DType, const A extends number | readonly number[] | undefined = undefined, K extends boolean = false>(x: Tensor<S, D>, axis?: A, keepDims?: K): Tensor<Reduced<S, A, K>, Summed<D>> => finish(ir.reduce(toNode(x), axis, keepDims), [x]));

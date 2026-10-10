@@ -6,10 +6,14 @@ import assert from 'node:assert/strict';
 import { create, globals } from 'webgpu';
 import { tensor, tensorType, bool, i8, u8, i16, u16, i32, u32, i64, u64, f16, f32, f64, compile, grad, valueAndGrad, customVjp, customJvp, map, sum, mul, add, matmul, relu, crossEntropy, reshape, type Tensor, type DType } from 'blaten';
 import { typegpu, inspect } from '@blaten/typegpu';
-import { sgd, gradientAccumulator, compileLazy, accumulate, meanMetric, meanAccumulator } from 'blaten';
+import { sgd, gradientAccumulator, compileLazy, accumulate, meanMetric, meanAccumulator, multiclassAccuracy } from 'blaten';
 import { square } from './helper.js';
 
 type WeightTree = { layer: { weight: Tensor<[2], typeof f32> }; bias: Tensor<[], typeof f32> };
+function classify(x: Tensor<[2, 3], typeof f32>, y: Tensor<[2], 'i32'>) {
+  'use kernel';
+  return x.argmax(-1).eq(y);
+}
 function treeLoss(p: WeightTree, x: Tensor<[2], typeof f32>) {
   'use kernel';
   return p.layer.weight.mul(x).mul(p.layer.weight).sum().add(p.bias.mul(p.bias));
@@ -41,7 +45,9 @@ function shaped(x: Tensor<Shape, typeof f32>) { 'use kernel'; return sum(reshape
 function inferredShape(x: Tensor<Shape, typeof f32>) { 'use kernel'; return x.reshape([x.shape[0] * x.shape[1]]).sum() }
 function activation(x: Tensor<Shape, typeof f32>) { 'use kernel'; return sum(mul(relu(x), x)) }
 function unmarked(x: number) { return x * 2 }
+// eslint-disable-next-line blaten/kernel-contract -- Negative fixture: compilation must reject an unmarked helper.
 function invalid(x: number) { 'use kernel'; return unmarked(x) }
+// eslint-disable-next-line blaten/kernel-contract -- Negative fixture: compilation must reject unsupported member access.
 function invalidMethod(x: Tensor<Shape, typeof f32>) { 'use kernel'; return (x as any).map(square) }
 const chained = (x: Tensor<Shape, typeof f32>) => { 'use kernel'; return x.mul(x).sum() };
 function negativeAxis(x: Tensor<Shape, typeof f32>) { 'use kernel'; return x.sum(-1, true) }
@@ -340,6 +346,24 @@ export async function main() {
     const vectorSnapshot = vectors.compute();
     vectors.reset(); vectors.dispose();
     near(await vectorSnapshot.read(), [3, 5]); vectorSnapshot.dispose();
+    const scores = tensor([1, 5, 5, 3, 1, 9], { shape: [2, 3] });
+    const gpuScores = await backend.copyFrom(scores);
+    const classification = await backend.compile(classify);
+    assert.deepEqual([...await backend.scope(() => classification(scores, tensor([1, 2], { shape: [2], dtype: 'i32' })).read())], [1, 1]);
+    classification.dispose();
+    near(await backend.scope(() => gpuScores.argmax(0).read()), [1, 0, 1]);
+    const nonfiniteScores = await backend.copyFrom(tensor([-Infinity, -Infinity, 0, 0, NaN, Infinity], { shape: [2, 3] }));
+    near(await backend.scope(() => nonfiniteScores.argmax(-1).read()), [2, 1]);
+    assert.deepEqual([...await backend.scope(() => nonfiniteScores.eq(nonfiniteScores).read())], [1, 1, 1, 1, 0, 1]);
+    nonfiniteScores.dispose();
+    gpuScores.read = async () => { throw new Error('Accuracy must not read logits') };
+    using accuracy = multiclassAccuracy();
+    backend.scope(() => accuracy.add({ logits: gpuScores, targets: tensor([0, 1, 0, 1, 0, 0], { shape: [2, 3] }), validCount: 1 }));
+    assert.equal(await backend.scope(() => accuracy.compute().item()), 1);
+    backend.scope(() => accuracy.add({ logits: gpuScores, targets: tensor([0, 1, 0, 1, 0, 0], { shape: [2, 3] }) }));
+    const accuracySnapshot = accuracy.compute();
+    accuracy.reset(); gpuScores.dispose(); scores.dispose();
+    assert.ok(Math.abs(await accuracySnapshot.item() - 2 / 3) < 1e-6); accuracySnapshot.dispose();
     const treePlan = await backend.compile(treeOutput);
     const returned = treePlan(treeParams);
     returned.layer[0].dispose(); returned.bias.dispose();

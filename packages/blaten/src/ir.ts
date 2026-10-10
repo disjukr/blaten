@@ -1,5 +1,5 @@
-import { sizeOf, f32, bool, u32, isDType, isFloat, scalarFitsInteger, scalarDType, promoteTypes, type DType, type Scalar, type Shape } from './types.js';
-export type Op = 'input' | 'constant' | 'cast' | 'and' | 'or' | 'not' | 'add' | 'sub' | 'mul' | 'div' | 'neg' | 'exp' | 'log' | 'tanh' | 'relu' | 'gt' | 'matmul' | 'transpose' | 'sum' | 'broadcast' | 'reshape' | 'softmax' | 'logsoftmax' | 'custom';
+import { sizeOf, f32, bool, u32, i32, isDType, isFloat, scalarFitsInteger, scalarDType, promoteTypes, type DType, type Scalar, type Shape } from './types.js';
+export type Op = 'input' | 'constant' | 'cast' | 'and' | 'or' | 'not' | 'add' | 'sub' | 'mul' | 'div' | 'neg' | 'exp' | 'log' | 'tanh' | 'relu' | 'gt' | 'eq' | 'argmax' | 'matmul' | 'transpose' | 'sum' | 'broadcast' | 'reshape' | 'softmax' | 'logsoftmax' | 'custom';
 let sequence = 0;
 export interface Node {
   readonly id: number; readonly op: Op; readonly inputs: readonly Node[];
@@ -31,12 +31,12 @@ export function broadcastShape(a: Shape, b: Shape): Shape {
     return Math.max(x, y);
   });
 }
-export function binary(op: 'add' | 'sub' | 'mul' | 'div' | 'gt', a: Node, b: Node): Node {
+export function binary(op: 'add' | 'sub' | 'mul' | 'div' | 'gt' | 'eq', a: Node, b: Node): Node {
   let dtype: DType; [a, b, dtype] = operands(a, b);
-  if (dtype === bool && op !== 'gt') throw new Error('Boolean arithmetic requires an explicit numeric cast');
+  if (dtype === bool && op !== 'gt' && op !== 'eq') throw new Error('Boolean arithmetic requires an explicit numeric cast');
   if (dtype === bool && op === 'gt') { a = cast(a, u32); b = cast(b, u32) }
   if (op === 'div' && !isFloat(dtype)) { dtype = f32; a = cast(a, dtype); b = cast(b, dtype) }
-  return node(op, [a, b], broadcastShape(a.shape, b.shape), {}, op === 'gt' ? bool : dtype);
+  return node(op, [a, b], broadcastShape(a.shape, b.shape), {}, op === 'gt' || op === 'eq' ? bool : dtype);
 }
 export function logical(op: 'and' | 'or' | 'not', a: Node, b?: Node): Node {
   if (a.dtype !== bool || (b && b.dtype !== bool)) throw new Error('Logical operations require bool inputs');
@@ -58,6 +58,18 @@ export function reduce(x: Node, axes?: number | readonly number[], keepDims = fa
   const normalized = selected.map(i => i < 0 ? i + x.shape.length : i).sort((a, b) => a - b);
   if (new Set(normalized).size !== normalized.length || normalized.some(i => !Number.isInteger(i) || i < 0 || i >= x.shape.length)) throw new Error('Invalid reduction axes');
   return node('sum', [x], x.shape.flatMap((n, i) => normalized.includes(i) ? keepDims ? [1] : [] : [n]), { axes: normalized, keepDims });
+}
+export function argmax(x: Node, axis: number): Node {
+  const normalized = axis < 0 ? axis + x.shape.length : axis;
+  if (!Number.isInteger(normalized) || normalized < 0 || normalized >= x.shape.length) throw new Error('Invalid argmax axis');
+  if (x.shape[normalized]! > 2147483647) throw new Error('argmax axis exceeds i32 index range');
+  if (x.dtype === bool) x = cast(x, u32);
+  return node('argmax', [x], x.shape.filter((_, i) => i !== normalized), { axis: normalized }, i32);
+}
+/** Count a prefix of a boolean vector, excluding padded rows without a host mask. */
+export function countTrue(x: Node, limit: number): Node {
+  if (x.dtype !== bool || x.shape.length !== 1 || !Number.isSafeInteger(limit) || limit <= 0 || limit > x.shape[0]!) throw new Error('Invalid boolean prefix count');
+  return node('sum', [cast(x, u32)], [], { axes: [0], keepDims: false, limit }, u32);
 }
 export function reshape(x: Node, shape: Shape): Node {
   if (sizeOf(shape) !== sizeOf(x.shape)) throw new Error('reshape must preserve element count');
@@ -101,7 +113,7 @@ export function vjp(output: Node, targets: readonly Node[], seed = constant(1, o
     const g = gradients.get(n); if (!g) continue;
     const [a, b] = n.inputs as [Node, Node];
     switch (n.op) {
-      case 'input': case 'constant': case 'gt': case 'and': case 'or': case 'not': break;
+      case 'input': case 'constant': case 'gt': case 'eq': case 'argmax': case 'and': case 'or': case 'not': break;
       case 'cast': if (isFloat(a.dtype)) accumulate(a, cast(g, a.dtype)); break;
       case 'add': accumulate(a, g); accumulate(b, g); break;
       case 'sub': accumulate(a, g); accumulate(b, unary('neg', g)); break;

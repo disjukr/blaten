@@ -167,7 +167,7 @@ const optimizer = sgd(parameters, { learningRate: 0.1 });
 optimizer.step(gradients);
 ```
 
-Parameters and gradients must have matching tree structure, environment, shapes, and floating dtypes. Record key insertion order does not matter. Parameter tensors must be distinct. Updates mutate parameter storage without reading GPU gradients on the CPU. The MNIST example normalizes data and prepares batches on the CPU, performs forward/backward computation and parameter updates on the GPU, and accumulates scalar loss on the GPU. Training batches submit work without a host read; epoch reporting reads average loss once. Evaluation submits every inference/readback before awaiting their results together.
+Parameters and gradients must have matching tree structure, environment, shapes, and floating dtypes. Record key insertion order does not matter. Parameter tensors must be distinct. Updates mutate parameter storage without reading GPU gradients on the CPU. The MNIST example normalizes data and prepares batches on the CPU, performs forward/backward computation and parameter updates on the GPU, and accumulates scalar loss on the GPU. Training batches submit work without a host read; epoch reporting reads average loss once. Evaluation accumulates multiclass accuracy on the GPU, excludes padded rows, and reads one scalar at the evaluation boundary. The example's `src/train.ts` contains training and evaluation; `src/run.ts` handles execution settings, dataset loading, result metadata, saving, and learning verification.
 
 ## Training and tensor lifetimes
 
@@ -201,6 +201,21 @@ const lossValue = await backend.scope(() => lossMetric.compute().item());
 `accumulate(optimizer, { steps })` wraps any `Optimizer<P>` exposing its bound `parameters` and `step(gradients)`. It borrows that optimizer and its parameters and owns the accumulation buffers. `step(grads, { weight })` averages gradients using positive finite weights and applies the wrapped optimizer every `steps` calls. `steps: 1` applies gradients directly. `flush()` applies a final partial window and is a no-op when empty. Disposal discards pending gradients; it does not apply updates or dispose the wrapped optimizer or parameters.
 
 `meanMetric({ dtype: f32 })` borrows floating scalar tensors and accumulates their weighted sum in the first value's environment. The default accumulation dtype is f32. `add(value, { weight })` performs no host reads; values must share an environment and weights must be positive and finite. `compute()` returns an independently owned scalar tensor, and rejects an empty metric. `reset()` releases accumulated state for the next epoch without invalidating computed tensors. Read host values explicitly with `item()` or `read()` on the result.
+
+`argmax(x, axis)` / `x.argmax(axis)` return i32 indices with the selected axis removed (negative axes are supported). Ties choose the first index; if there are NaNs, the first NaN is selected. `eq(a, b)` / `a.eq(b)` compare values after dtype promotion and return a bool tensor with the broadcast shape. Scalar-only `eq` returns a JS boolean. Both operations are nondifferentiable.
+
+`multiclassAccuracy()` implements `Accumulator<MulticlassAccuracyInput, TensorF32<[]>>`. Pass one object to `add`:
+
+```ts
+using accuracy = multiclassAccuracy();
+backend.scope(() => {
+  const [x, y] = batch.toTensors();
+  accuracy.add({ logits: inference(parameters, x), targets: y, validCount: batch.size });
+});
+const score = await backend.scope(() => accuracy.compute().item());
+```
+
+Logits and one-hot targets must have matching `[batch, classes]` shapes. `validCount` defaults to the full batch and selects the leading real rows, excluding padding; it must be a positive integer at most the batch size. The metric accumulates correct and sample counts in one environment, and `compute()` returns their ratio as an independently owned f32 scalar without a host read. When an input is on the GPU, host inputs are uploaded to that device; inputs from different devices are rejected. Optional common accumulator weights uniformly weight the samples in each added batch. `weight` reports the total weighted sample count. `reset()` releases the metric state and computed snapshots remain valid.
 
 Tensors, gradient accumulators, accumulating optimizer wrappers, and metrics implement `Symbol.dispose` as well as `dispose()`, so TypeScript `using` declarations release them on block exit, including exceptions. Persistent helper buffers survive batch scopes and are released by their owning helper.
 

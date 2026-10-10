@@ -1,4 +1,4 @@
-import { zeros, add, div, matmul, relu, neg, sum, mean, softmax, cast, reshape, transpose, crossEntropy, gt, and, not, meanMetric, meanAccumulator, gradientAccumulator, accumulate, sgd, type Accumulator, type Tensor, type Shape } from '../src/index.js';
+import { zeros, add, div, matmul, relu, neg, sum, mean, softmax, cast, reshape, transpose, crossEntropy, gt, and, not, argmax, eq, multiclassAccuracy, type MulticlassAccuracyInput, meanMetric, meanAccumulator, gradientAccumulator, accumulate, sgd, type Accumulator, type Tensor, type Shape } from '../src/index.js';
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
 type Expect<T extends true> = T;
@@ -85,4 +85,19 @@ export type AccumulatorChecks = [
   Expect<Equal<typeof averagedTree, typeof tree>>,
   Expect<Equal<typeof averagedGradient, typeof tree>>,
   Expect<Equal<typeof averagedMetric, Tensor<readonly [], 'f32'>>>
+];
+
+const predicted = prediction.argmax(-1);
+const predictedFunction = argmax(prediction, 0);
+const compared = predicted.eq(zeros([1], { dtype: 'i32' }));
+const comparedFunction = eq(predicted, 0);
+using accuracy = multiclassAccuracy();
+const accuracyValue = accuracy.compute();
+export type ClassificationChecks = [
+  Expect<Equal<typeof predicted, Tensor<readonly [2], 'i32'>>>,
+  Expect<Equal<typeof predictedFunction, Tensor<readonly [4], 'i32'>>>,
+  Expect<Equal<typeof compared, Tensor<readonly [2], 'bool'>>>,
+  Expect<Equal<typeof comparedFunction, typeof compared>>,
+  Expect<Equal<typeof accuracyValue, Tensor<readonly [], 'f32'>>>,
+  Expect<Equal<typeof accuracy, Accumulator<MulticlassAccuracyInput, Tensor<readonly [], 'f32'>>>>
 ];

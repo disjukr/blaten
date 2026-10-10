@@ -158,7 +158,7 @@ export function mapKernel(fn: KernelFunction, value: ir.Node, stack: KernelFunct
   const replace = new Map<ir.Node, ir.Node>([[element, value]]);
   const clone = (n: ir.Node): ir.Node => {
     const old = replace.get(n); if (old) return old;
-    if (!['constant', 'cast', 'and', 'or', 'not', 'add', 'sub', 'mul', 'div', 'neg', 'exp', 'log', 'tanh', 'relu', 'gt'].includes(n.op)) throw new Error('map callback must be an elementwise scalar kernel');
+    if (!['constant', 'cast', 'and', 'or', 'not', 'add', 'sub', 'mul', 'div', 'neg', 'exp', 'log', 'tanh', 'relu', 'gt', 'eq'].includes(n.op)) throw new Error('map callback must be an elementwise scalar kernel');
     const children = n.inputs.map(clone);
     const shape = children.reduce<readonly number[]>((s, c) => ir.broadcastShape(s, c.shape), []);
     const result = ir.node(n.op, children, shape, n.attrs, n.dtype); replace.set(n, result); return result;

@@ -78,6 +78,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
   sub<X extends Operand>(x: X): Tensor<Broadcast<S, OperandShape<X>>, BinaryDType<Tensor<S, D>, X>> { return intrinsics.sub(this, x) as Tensor<Broadcast<S, OperandShape<X>>, BinaryDType<Tensor<S, D>, X>> }
   mul<X extends Operand>(x: X): Tensor<Broadcast<S, OperandShape<X>>, BinaryDType<Tensor<S, D>, X>> { return intrinsics.mul(this, x) as Tensor<Broadcast<S, OperandShape<X>>, BinaryDType<Tensor<S, D>, X>> }
   div<X extends Operand>(x: X): Tensor<Broadcast<S, OperandShape<X>>, Floating<BinaryDType<Tensor<S, D>, X>>> { return intrinsics.div(this, x) as Tensor<Broadcast<S, OperandShape<X>>, Floating<BinaryDType<Tensor<S, D>, X>>> }
+  eq<X extends Operand>(x: X): Tensor<Broadcast<S, OperandShape<X>>, typeof bool> { return intrinsics.eq(this, x) }
   gt<X extends Operand>(x: X): Tensor<Broadcast<S, OperandShape<X>>, typeof bool> { return intrinsics.gt(this, x) as Tensor<Broadcast<S, OperandShape<X>>, typeof bool> }
   and<X extends Tensor<Shape, typeof bool> | boolean>(x: X): Tensor<Broadcast<S, OperandShape<X>>, typeof bool> { return intrinsics.and(this, x) as Tensor<Broadcast<S, OperandShape<X>>, typeof bool> }
   or<X extends Tensor<Shape, typeof bool> | boolean>(x: X): Tensor<Broadcast<S, OperandShape<X>>, typeof bool> { return intrinsics.or(this, x) as Tensor<Broadcast<S, OperandShape<X>>, typeof bool> }
@@ -90,6 +91,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
   softmax(): Tensor<S, Floating<D>> { return intrinsics.softmax(this) as Tensor<S, Floating<D>> }
   cast<E extends DType>(dtype: E): Tensor<S, E> { return intrinsics.cast(this, dtype) }
   matmul<R extends Shape, E extends DType>(x: Tensor<R, E>): Tensor<MatmulShape<S, R>, Promote<D, E>> { return intrinsics.matmul(this, x) as Tensor<MatmulShape<S, R>, Promote<D, E>> }
+  argmax<const A extends number>(axis: A): Tensor<Reduced<S, A, false>, 'i32'> { return intrinsics.argmax(this, axis) }
   transpose(): Tensor<Transposed<S>, D> { return intrinsics.transpose(this) }
   reshape<const R extends Shape>(shape: R): Tensor<R, D> { return intrinsics.reshape(this, shape) }
   sum<const A extends number | readonly number[] | undefined = undefined, K extends boolean = false>(axis?: A, keepDims?: K): Tensor<Reduced<S, A, K>, Summed<D>> { return intrinsics.sum(this, axis, keepDims) as Tensor<Reduced<S, A, K>, Summed<D>> }

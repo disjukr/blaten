@@ -12,7 +12,7 @@ interface Environment {
 const environments = new WeakMap<object, Environment>();
 export function registerEnvironment(owner: object, environment: Environment): void { environments.set(owner, environment) }
 
-export function execute(program: Program, inputs: readonly TensorOrScalar[]): Tensor | Tensor[] {
+export function execute(program: Program, inputs: readonly TensorOrScalar[], options: { uploadHostInputs?: boolean } = {}): Tensor | Tensor[] {
   const owners = new Set(inputs.flatMap(input => {
     if (!(input instanceof Tensor)) return [];
     const storage = storageOf(input);
@@ -20,7 +20,7 @@ export function execute(program: Program, inputs: readonly TensorOrScalar[]): Te
   }));
   if (owners.size > 1) throw new Error('Tensor operations cannot mix backend environments; use copyFrom() first');
   if (owners.size) {
-    if (inputs.some(input => input instanceof Tensor && isHostStorage(storageOf(input)))) throw new Error('Tensor operations cannot mix host and backend tensors; use copyFrom() first');
+    if (!options.uploadHostInputs && inputs.some(input => input instanceof Tensor && isHostStorage(storageOf(input)))) throw new Error('Tensor operations cannot mix host and backend tensors; use copyFrom() first');
     const environment = environments.get([...owners][0]!);
     if (!environment) throw new Error('This tensor environment does not support direct operations');
     return environment.execute(program, inputs);

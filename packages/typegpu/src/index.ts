@@ -13,6 +13,11 @@ type Buffer = ReturnType<TgpuRoot['createBuffer']>;
 const sameShape = (a: Shape, b: Shape) => String(a) === String(b);
 const storageType = (dtype: DType) => dtype === 'bool' || dtype.startsWith('u') ? 'u32' : dtype.startsWith('i') ? 'i32' : dtype;
 const gpuBytes = (count: number, dtype: DType) => dtype === 'f16' ? Math.ceil(count / 2) * 4 : count * 4;
+// Bit tests preserve NaN handling on devices that optimize x != x away.
+function isNaNValue(value: ast.E): ast.E {
+  const bits = ast.call(ast.call(ast.member('std', 'bitcast'), ast.member('d', 'f32'), ast.member('d', 'u32')), ast.scalar('f32', value));
+  return ast.binary(ast.binary(bits, '&', ast.uint(0x7fffffff)), '>', ast.uint(0x7f800000));
+}
 function coordinate(index: ast.E, shape: Shape, axis: number): ast.E {
   const stride = sizeOf(shape.slice(axis + 1));
   return ast.binary(stride === 1 ? index : ast.intdiv(index, ast.uint(stride)), '%', ast.uint(shape[axis]!));
@@ -158,7 +163,7 @@ export class TypeGpuBackend implements Backend {
     const steps: { pipeline: TgpuComputePipeline; count: number }[] = [];
     const allocate = (n: Node, data?: HostStorage) => { const b = this.acquireWorkspace(n.shape, n.dtype); buffers.set(n, b); if (data) this.write(b, data, n.dtype); return b };
     // Materialize expensive operations and outputs; fuse elementwise/view IR into their consumers.
-    const boundaries = new Set(['matmul', 'sum', 'softmax', 'logsoftmax']);
+    const boundaries = new Set(['matmul', 'argmax', 'sum', 'softmax', 'logsoftmax']);
     try {
       program.inputs.forEach(n => allocate(n));
       for (const n of order) {
@@ -193,6 +198,15 @@ export class TypeGpuBackend implements Backend {
             case 'broadcast': return read(a!);
             case 'transpose': return emit(a!, ast.binary(ast.binary(ast.binary(index, '%', ast.uint(node.shape[1]!)), '*', ast.uint(a!.shape[1]!)), '+', ast.intdiv(index, ast.uint(node.shape[1]!))), statements, memo);
             case 'add': case 'sub': case 'mul': case 'div': expression = ast.binary(read(a!), { add: '+', sub: '-', mul: '*', div: '/' }[node.op], read(b!)); break;
+            case 'eq': {
+              const left = read(a!), right = read(b!);
+              expression = ast.binary(left, '===', right);
+              if (isFloat(a!.dtype)) {
+                expression = ast.call(ast.member('std', 'select'), expression, false, isNaNValue(left));
+                expression = ast.call(ast.member('std', 'select'), expression, false, isNaNValue(right));
+              }
+              break;
+            }
             case 'gt': expression = ast.binary(read(a!), '>', read(b!)); break;
             case 'and': case 'or': expression = ast.binary(read(a!), node.op === 'and' ? '&&' : '||', read(b!)); break;
             case 'not': expression = [4, '!', read(a!)]; break;
@@ -218,6 +232,26 @@ export class TypeGpuBackend implements Backend {
           const right = emit(b!, ast.binary(ast.binary('k', '*', ast.uint(columns)), '+', 'column'), loopBody, memo);
           loopBody.push([2, 'total', '+=', ast.binary(ast.scalar(accumulatorDType, left), '*', ast.scalar(accumulatorDType, right))]);
           work.push(ast.loop('k', inner, loopBody), ast.assign(ast.at('output', 'index'), ast.scalar(n.dtype, 'total')));
+        } else if (n.op === 'argmax') {
+          const axis: number = n.attrs.axis, width = a!.shape[axis]!;
+          const stride = sizeOf(a!.shape.slice(axis + 1));
+          const start = ast.binary(ast.binary(ast.intdiv('index', ast.uint(stride)), '*', ast.uint(width * stride)), '+', ast.binary('index', '%', ast.uint(stride)));
+          work.push([13, 'start', start]);
+          const initial = emit(a!, 'start', work, new Map());
+          work.push([12, 'maximum', initial], [12, 'best', ast.uint(0)]);
+          const loopBody: ast.S[] = [];
+          const candidate = emit(a!, ast.binary('start', '+', ast.binary('k', '*', ast.uint(stride))), loopBody, new Map());
+          loopBody.push([13, 'candidate', candidate]);
+          loopBody.push([12, 'wins', ast.binary('candidate', '>', 'maximum')]);
+          if (isFloat(a!.dtype)) {
+            loopBody.push([13, 'maximumNaN', isNaNValue('maximum')], [13, 'candidateNaN', isNaNValue('candidate')]);
+            loopBody.push([11, 'maximumNaN', ast.block([ast.assign('wins', false)])]);
+            loopBody.push([11, 'candidateNaN', ast.block([
+              [11, [4, '!', 'maximumNaN'], ast.block([ast.assign('wins', true)])],
+            ])]);
+          }
+          loopBody.push([11, 'wins', ast.block([ast.assign('maximum', 'candidate'), ast.assign('best', 'k')])]);
+          work.push(ast.loop('k', width, loopBody), ast.assign(ast.at('output', 'index'), ast.scalar('i32', 'best')));
         } else if (n.op === 'sum') {
           const axes: number[] = n.attrs.axes;
           const reduced = axes.map(i => a!.shape[i]!);
@@ -231,7 +265,7 @@ export class TypeGpuBackend implements Backend {
             inputIndex = ast.binary(ast.binary(inputIndex, '*', ast.uint(dim)), '+', part);
           });
           loopBody.push([2, 'total', '+=', ast.scalar(accumulatorDType, emit(a!, inputIndex, loopBody, memo))]);
-          work.push(ast.loop('k', sizeOf(reduced), loopBody), ast.assign(ast.at('output', 'index'), ast.scalar(n.dtype, 'total')));
+          work.push(ast.loop('k', n.attrs.limit ?? sizeOf(reduced), loopBody), ast.assign(ast.at('output', 'index'), ast.scalar(n.dtype, 'total')));
         } else if (n.op === 'softmax' || n.op === 'logsoftmax') {
           const width = n.shape.at(-1)!; count /= width;
           work.push([13, 'start', ast.binary('index', '*', ast.uint(width))], [12, 'maximum', ast.scalar(accumulatorDType, ast.num(-3.4028234663852886e38))], [12, 'total', ast.scalar(accumulatorDType, ast.num(0))]);
