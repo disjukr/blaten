@@ -1,4 +1,4 @@
-import { zeros, add, div, matmul, relu, neg, sum, mean, softmax, cast, reshape, transpose, crossEntropy, gt, and, not, type Tensor, type Shape } from '../src/index.js';
+import { zeros, add, div, matmul, relu, neg, sum, mean, softmax, cast, reshape, transpose, crossEntropy, gt, and, not, meanMetric, meanAccumulator, gradientAccumulator, accumulate, sgd, type Accumulator, type Tensor, type Shape } from '../src/index.js';
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
 type Expect<T extends true> = T;
@@ -51,3 +51,38 @@ const wrongShape: Tensor<readonly [2, 3], 'f32'> = prediction;
 // @ts-expect-error mixed integer tensors promote to i16
 const wrongDType: Tensor<readonly [2, 3], 'i8'> = mixed;
 void wrongShape; void wrongDType;
+
+using metric = meanMetric();
+const metricValue = metric.compute();
+using halfMetric = meanMetric({ dtype: 'f16' });
+const halfValue = halfMetric.compute();
+using optimizer = accumulate(sgd({ weights: w, bias }, { learningRate: 0.1 }), { steps: 4 });
+optimizer.step({ weights: w, bias });
+// @ts-expect-error gradients must preserve parameter shapes
+optimizer.step({ weights: x, bias });
+export type MetricChecks = [
+  Expect<Equal<typeof metricValue, Tensor<readonly [], 'f32'>>>,
+  Expect<Equal<typeof halfValue, Tensor<readonly [], 'f16'>>>
+];
+
+const tree = { layer: [w, bias] as const };
+using treeMean = meanAccumulator(tree);
+using gradients = gradientAccumulator(tree);
+function collect<I, O>(accumulator: Accumulator<I, O>, input: I): O {
+  accumulator.add(input);
+  return accumulator.compute();
+}
+const averagedTree = collect(treeMean, tree);
+const averagedGradient = collect(gradients, tree);
+const averagedMetric = collect(metric, zeros([]));
+// @ts-expect-error input shape must match the template
+collect(treeMean, { layer: [x, bias] as const });
+// @ts-expect-error legacy method names have been replaced by compute/reset
+gradients.mean();
+export type AccumulatorChecks = [
+  Expect<Equal<typeof treeMean, Accumulator<typeof tree>>>,
+  Expect<Equal<typeof gradients, Accumulator<typeof tree>>>,
+  Expect<Equal<typeof averagedTree, typeof tree>>,
+  Expect<Equal<typeof averagedGradient, typeof tree>>,
+  Expect<Equal<typeof averagedMetric, Tensor<readonly [], 'f32'>>>
+];

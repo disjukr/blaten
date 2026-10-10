@@ -181,19 +181,34 @@ function loss(p: Parameters, x: Tensor<[number, 784], typeof f32>, y: Tensor<[nu
 }
 const parameters = await backend.copyFrom(initialParameters);
 const training = await backend.compile(valueAndGrad(loss), { inputs: [parameters, sampleX, sampleY] });
-const optimizer = sgd(parameters, { learningRate: 0.1 });
+using optimizer = accumulate(sgd(parameters, { learningRate: 0.1 }), { steps: 4 });
+using lossMetric = meanMetric();
 
-const lossValue = await backend.scope(() => {
-  const [x, y] = batch.toTensors();
-  const { value, grads } = training(parameters, x, y);
-  optimizer.step(grads);
-  return value.item();
-});
+for (const batch of epochBatches) {
+  backend.scope(() => {
+    const [x, y] = batch.toTensors();
+    const { value, grads } = training(parameters, x, y);
+    optimizer.step(grads, { weight: batch.size });
+    lossMetric.add(value, { weight: batch.size });
+  });
+}
+optimizer.flush();
+const lossValue = await backend.scope(() => lossMetric.compute().item());
 ```
 
 `scope()` tracks tensors created synchronously inside its callback, including CPU batch tensors and GPU operation results. It releases temporaries on normal return or exception. Returned tensors, including tensors inside arrays or records, escape to the caller (or an enclosing scope); borrowed input tensors are untouched. A synchronous callback can return a read Promise: cleanup waits for it to settle, including rejection. Async callbacks are rejected; allocations after an `await` or inside a Promise continuation are not part of the scope. This keeps allocation ownership local without a Node-specific async context. `scope()` is also exported directly by `blaten`, and `disposeTree()` releases an explicitly owned tensor tree.
 
-For accumulation, keep an accumulator outside the batch scope:
+`accumulate(optimizer, { steps })` wraps any `Optimizer<P>` exposing its bound `parameters` and `step(gradients)`. It borrows that optimizer and its parameters and owns the accumulation buffers. `step(grads, { weight })` averages gradients using positive finite weights and applies the wrapped optimizer every `steps` calls. `steps: 1` applies gradients directly. `flush()` applies a final partial window and is a no-op when empty. Disposal discards pending gradients; it does not apply updates or dispose the wrapped optimizer or parameters.
+
+`meanMetric({ dtype: f32 })` borrows floating scalar tensors and accumulates their weighted sum in the first value's environment. The default accumulation dtype is f32. `add(value, { weight })` performs no host reads; values must share an environment and weights must be positive and finite. `compute()` returns an independently owned scalar tensor, and rejects an empty metric. `reset()` releases accumulated state for the next epoch without invalidating computed tensors. Read host values explicitly with `item()` or `read()` on the result.
+
+Tensors, gradient accumulators, accumulating optimizer wrappers, and metrics implement `Symbol.dispose` as well as `dispose()`, so TypeScript `using` declarations release them on block exit, including exceptions. Persistent helper buffers survive batch scopes and are released by their owning helper.
+
+All mean accumulators implement the public `Accumulator<Input, Output = Input>` interface: `weight`, `add(value, { weight })`, `compute()`, `reset()`, `dispose()`, and `Symbol.dispose`. The input and result types are independent: scalar metrics accept any floating scalar dtype and return their configured dtype, while tree accumulators preserve the template's shape, dtype, tuple, and record types.
+
+`meanAccumulator(template)` computes a weighted mean of any nonempty floating tensor tree, including vectors and nested records. The template supplies only structure, shape, dtype, and environment metadata; its values are not accumulated and it may be disposed after construction. Inputs must match that metadata. Repeated tensor leaves are allowed. `reset()` zeros and reuses persistent buffers, including after nonfinite inputs, without invalidating computed snapshots. `gradientAccumulator(parameters)` is a thin wrapper that additionally requires distinct parameter tensors. Both use `compute()` and `reset()`; the earlier `mean()` and `clear()` names have been removed.
+
+For manual accumulation, keep an accumulator outside the batch scope:
 
 ```ts
 const accumulator = gradientAccumulator(parameters);
@@ -203,13 +218,13 @@ backend.scope(() => {
 });
 // Repeat add() for more batches before updating parameters.
 backend.scope(() => {
-  optimizer.step(accumulator.mean());
-  accumulator.clear();
+  optimizer.step(accumulator.compute());
+  accumulator.reset();
 });
 accumulator.dispose();
 ```
 
-`add()` borrows gradients and maintains independent persistent buffers in their environment. On GPU parameters, weighting, addition, averaging, clearing, and SGD stay on the GPU. `weight` is a positive finite number (default 1); use the actual sample count for batches whose loss is a per-sample mean. `mean()` returns independently owned tensors and rejects an empty accumulator. `clear()` resets the weight and reuses accumulation buffers; `dispose()` releases them. Flush a final partial accumulation window using its actual weight.
+`add()` borrows gradients and maintains independent persistent buffers in their environment. On GPU parameters, weighting, addition, averaging, clearing, and SGD stay on the GPU. `weight` is a positive finite number (default 1); use the actual sample count for batches whose loss is a per-sample mean. `compute()` returns independently owned tensors and rejects an empty accumulator. `reset()` resets the weight and reuses accumulation buffers; `dispose()` releases them. Flush a final partial accumulation window using its actual weight.
 
 ## Function types and compilation
 

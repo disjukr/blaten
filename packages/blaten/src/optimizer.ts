@@ -1,8 +1,9 @@
 import { Tensor, storageOf } from './tensor.js';
 import { execute, assign } from './execution.js';
 import { isFloat, isHostStorage } from './types.js';
-import { tensors, sameLayout, unflattenTree, type TensorTree } from './tree.js';
-import { keepTensor, scope } from './scope.js';
+import { tensors, sameLayout, type TensorTree } from './tree.js';
+import { scope } from './scope.js';
+import { meanAccumulator, type Accumulator } from './accumulator.js';
 import * as ir from './ir.js';
 
 function validate(parameters: readonly Tensor[], gradients: readonly Tensor[]): void {
@@ -15,11 +16,15 @@ function validate(parameters: readonly Tensor[], gradients: readonly Tensor[]): 
     if (!isFloat(parameter.dtype) || parameter.dtype !== gradient.dtype || String(parameter.shape) !== String(gradient.shape)) throw new Error('Requires matching floating parameters and gradients');
   });
 }
-export function sgd<P extends TensorTree>(parameters: P, options: { learningRate: number }) {
+export interface Optimizer<P extends TensorTree> {
+  readonly parameters: P;
+  step(gradients: P): void;
+}
+export function sgd<P extends TensorTree>(parameters: P, options: { learningRate: number }): Optimizer<P> {
   const { leaves: parametersCopy, layout } = tensors(parameters), rate = options.learningRate;
   if (!parametersCopy.length || new Set(parametersCopy).size !== parametersCopy.length) throw new Error('SGD requires distinct parameters');
   if (!(rate > 0) || !Number.isFinite(rate)) throw new Error('SGD requires a positive finite learning rate');
-  return { step(gradients: P): void {
+  return { parameters, step(gradients: P): void {
     const tree = tensors(gradients);
     if (!sameLayout(layout, tree.layout)) throw new Error('SGD gradient tree does not match parameters');
     validate(parametersCopy, tree.leaves);
@@ -31,51 +36,42 @@ export function sgd<P extends TensorTree>(parameters: P, options: { learningRate
   } };
 }
 
-/** Owns persistent buffers in the parameters' environment. add() borrows its input. */
-export function gradientAccumulator<P extends TensorTree>(parameters: P) {
-  const { leaves, layout } = tensors(parameters);
+/** A weighted mean accumulator constrained to distinct floating parameters. */
+export function gradientAccumulator<P extends TensorTree>(parameters: P): Accumulator<P> {
+  const { leaves } = tensors(parameters);
   if (!leaves.length || new Set(leaves).size !== leaves.length) throw new Error('Accumulator requires distinct parameters');
-  validate(leaves, leaves);
-  let buffers: Tensor[] = [], totalWeight = 0, disposed = false;
-  const alive = () => { if (disposed) throw new Error('Gradient accumulator is disposed') };
+  return meanAccumulator(parameters);
+}
+
+/** Borrows the optimizer and parameters; owns only its accumulation buffers. */
+export function accumulate<P extends TensorTree>(optimizer: Optimizer<P>, options: { steps: number }) {
+  const { steps } = options;
+  if (!Number.isSafeInteger(steps) || steps <= 0) throw new Error('Accumulation steps must be a positive integer');
+  const accumulator = gradientAccumulator(optimizer.parameters);
+  let pendingSteps = 0, disposed = false;
+  const alive = () => { if (disposed) throw new Error('Accumulating optimizer is disposed') };
   return {
-    get weight() { return totalWeight },
-    add(gradients: P, options: { weight?: number } = {}): void {
+    parameters: optimizer.parameters,
+    get pendingSteps() { return pendingSteps },
+    step(gradients: P, options: { weight?: number } = {}): void {
       alive();
-      const weight = options.weight ?? 1, tree = tensors(gradients);
-      if (!Number.isFinite(weight) || weight <= 0 || !Number.isFinite(totalWeight + weight)) throw new Error('Gradient weight must be positive and finite');
-      if (!sameLayout(layout, tree.layout)) throw new Error('Gradient tree does not match parameters');
-      validate(leaves, tree.leaves);
-      if (!buffers.length) {
-        const created: Tensor[] = [];
-        try { tree.leaves.forEach(g => created.push(g.mul(weight))) }
-        catch (error) { created.forEach(g => g.dispose()); throw error }
-        created.forEach(keepTensor); buffers = created;
-      } else {
-        validate(buffers, tree.leaves);
-        const inputs = [...buffers, ...tree.leaves].map((value, index) => ir.node('input', [], value.shape, { index }, value.dtype));
-        const outputs = buffers.map((buffer, index) => ir.binary('add', inputs[index]!, ir.binary('mul', inputs[index + buffers.length]!, ir.constant(weight, buffer.dtype))));
-        const result = execute({ inputs, outputs, single: false }, [...buffers, ...tree.leaves]) as Tensor[];
-        try { result.forEach((value, index) => assign(buffers[index]!, value)) }
-        finally { result.forEach(value => value.dispose()) }
-      }
-      totalWeight += weight;
+      const weight = options.weight ?? 1;
+      if (!Number.isFinite(weight) || weight <= 0) throw new Error('Gradient weight must be positive and finite');
+      if (steps === 1) { optimizer.step(gradients); return }
+      if (pendingSteps >= steps) this.flush();
+      accumulator.add(gradients, { weight });
+      pendingSteps++;
+      if (pendingSteps === steps) this.flush();
     },
-    mean(): P {
-      alive(); if (!totalWeight) throw new Error('Cannot average an empty gradient accumulator');
-      return scope(() => unflattenTree(layout, buffers.map(value => value.div(totalWeight)))) as P;
-    },
-    clear(): void {
+    flush(): void {
       alive();
-      if (buffers.length) {
-        const inputs = buffers.map((value, index) => ir.node('input', [], value.shape, { index }, value.dtype));
-        const outputs = buffers.map(value => ir.broadcast(ir.constant(0, value.dtype), value.shape));
-        const zeros = execute({ inputs, outputs, single: false }, buffers) as Tensor[];
-        try { zeros.forEach((value, index) => assign(buffers[index]!, value)) }
-        finally { zeros.forEach(value => value.dispose()) }
-      }
-      totalWeight = 0;
+      if (!pendingSteps) return;
+      scope(() => optimizer.step(accumulator.compute()));
+      accumulator.reset();
+      pendingSteps = 0;
     },
-    dispose(): void { if (disposed) return; buffers.forEach(value => value.dispose()); buffers = []; totalWeight = 0; disposed = true },
+    // Cleanup discards pending gradients; updates must be explicit, even on errors.
+    dispose(): void { if (disposed) return; accumulator.dispose(); pendingSteps = 0; disposed = true },
+    [Symbol.dispose](): void { this.dispose() },
   };
 }

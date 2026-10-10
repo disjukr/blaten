@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { sgd, tensor, valueAndGrad, gradientAccumulator, type Executable, type TensorF32 } from 'blaten';
+import { sgd, valueAndGrad, accumulate, meanMetric, type Executable } from 'blaten';
 import { inspect, type TypeGpuBackend } from '@blaten/typegpu';
 import { hiddenSize, initParameters, loss, predict, type Parameters } from './model.js';
 import { load, batches, type Dataset } from './data.js';
@@ -46,37 +46,28 @@ export async function main() {
         backend.compile(predict, { inputs: [parameters, x] }),
       ]);
     });
-    const optimizer = sgd(parameters, { learningRate }), accumulator = gradientAccumulator(parameters);
-    const update = () => backend.scope(() => { optimizer.step(accumulator.mean()); accumulator.clear() });
+    using optimizer = accumulate(sgd(parameters, { learningRate }), { steps: accumulationSteps });
+    using lossMetric = meanMetric();
     const accuracy = () => evaluate(backend, inference, parameters, testData, testSize, batchSize);
     console.log(`MNIST 784 → ${hiddenSize} → 10 on ${adapter.info.description || adapter.info.device || 'WebGPU'}; ${inspect(training).dispatchCount} training dispatches/batch`);
     const initialAccuracy = await accuracy(), history: { epoch: number; loss: number; accuracy: number }[] = [];
     console.log(`Before training: ${(initialAccuracy * 100).toFixed(2)}% test accuracy`);
-    try {
-      for (let epoch = 1; epoch <= epochs; epoch++) {
-        let totalLoss: TensorF32 = await backend.scope(() => backend.copyFrom(tensor(0, { shape: [] })));
-        let count = 0;
-        try {
-          for (const batch of batches(trainData, { size: trainSize, batchSize, shuffleSeed: 100 + epoch, dropLast: true })) {
-            const previousLoss = totalLoss;
-            totalLoss = backend.scope(() => {
-              const [x, y] = batch.toTensors(), { value, grads } = training(parameters, x, y);
-              if (accumulationSteps === 1) optimizer.step(grads);
-              else accumulator.add(grads, { weight: batch.size });
-              return totalLoss.add(value);
-            });
-            previousLoss.dispose();
-            if (++count % accumulationSteps === 0 && accumulator.weight) update();
-          }
-          if (accumulator.weight) update();
-          // Reporting is the synchronization boundary, independent of batch/update size.
-          const averageLoss = await backend.scope(() => totalLoss.div(count).item());
-          const measured = { epoch, loss: averageLoss, accuracy: await accuracy() };
-          history.push(measured);
-          console.log(`Epoch ${epoch}/${epochs}: loss=${measured.loss.toFixed(4)}, test accuracy=${(measured.accuracy * 100).toFixed(2)}%`);
-        } finally { totalLoss.dispose() }
+    for (let epoch = 1; epoch <= epochs; epoch++) {
+      lossMetric.reset();
+      for (const batch of batches(trainData, { size: trainSize, batchSize, shuffleSeed: 100 + epoch, dropLast: true })) {
+        backend.scope(() => {
+          const [x, y] = batch.toTensors(), { value, grads } = training(parameters, x, y);
+          optimizer.step(grads, { weight: batch.size });
+          lossMetric.add(value, { weight: batch.size });
+        });
       }
-    } finally { accumulator.dispose() }
+      optimizer.flush();
+      // Reporting is the synchronization boundary, independent of batch/update size.
+      const averageLoss = await backend.scope(() => lossMetric.compute().item());
+      const measured = { epoch, loss: averageLoss, accuracy: await accuracy() };
+      history.push(measured);
+      console.log(`Epoch ${epoch}/${epochs}: loss=${measured.loss.toFixed(4)}, test accuracy=${(measured.accuracy * 100).toFixed(2)}%`);
+    }
     return {
       verifiedAt: new Date().toISOString(), dataset: 'MNIST (CVDF IDX)', backend: 'typegpu', typegpuVersion: createRequire(import.meta.url)('typegpu/package.json').version,
       node: process.version, platform: process.platform, architecture: process.arch,

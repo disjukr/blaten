@@ -6,7 +6,11 @@ export { grad, valueAndGrad, customJvp, customVjp, kernelIr } from './kernel.js'
 export { add, sub, mul, div, gt, and, or, not, cast, neg, exp, log, tanh, relu, matmul, transpose, reshape, sum, mean, softmax, crossEntropy, map } from './intrinsics.js';
 export { compile, compileLazy } from './runtime.js';
 export type { Backend, Executable, CompileOptions, TensorOrScalar, KernelInput, GradientTree, RuntimeResult } from './runtime.js';
-export { sgd, gradientAccumulator } from './optimizer.js';
+export { sgd, gradientAccumulator, accumulate } from './optimizer.js';
+export type { Optimizer } from './optimizer.js';
+export { meanMetric } from './metrics.js';
+export { meanAccumulator } from './accumulator.js';
+export type { Accumulator } from './accumulator.js';
 export { getIntrinsic, getIntrinsics } from './intrinsics.js';
 export type { Intrinsic } from './intrinsics.js';
 export { scope } from './scope.js';

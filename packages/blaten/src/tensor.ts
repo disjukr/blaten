@@ -99,6 +99,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
     if (!this.disposed && storage && !isHostStorage(storage)) storage.dispose();
     this.disposed = true;
   }
+  [Symbol.dispose](): void { this.dispose() }
 }
 function flatten(data: Nested): { values: Scalar[]; shape: number[] } {
   if (!Array.isArray(data)) return { values: [data as Scalar], shape: [] };
