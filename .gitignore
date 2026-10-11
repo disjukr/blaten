@@ -1,5 +1,6 @@
 node_modules/
 dist/
+tmp/
 .cache/
 examples/mnist/data/
 examples/mnist/results/*.json

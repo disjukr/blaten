@@ -1,7 +1,7 @@
 import tgpu, { type TgpuRoot, type TgpuComputePipeline } from 'typegpu';
 import * as d from 'typegpu/data';
 import { Tensor, type TensorTree, type Shape, type DType, type HostStorage, type Scalar } from 'blaten';
-import { lower, signatureOf, topological, sizeOf, isHostStorage, isFloat, makeStorage, type Node, type KernelFunction, type Backend, type Executable, type Program, type CompileOptions, type TensorOrScalar, storageOf, hostData, deviceStorageOf, registerEnvironment, callable, isKernelLeaf, flattenTree, unflattenTree, sameLayout, scope, tensors } from 'blaten/backend';
+import { lower, signatureOf, topological, sizeOf, isHostStorage, isFloat, makeStorage, type Node, type KernelFunction, type Backend, type Executable, type Program, type CompileOptions, type TensorOrScalar, storageOf, hostData, deviceStorageOf, registerEnvironment, callable, isKernelLeaf, flattenTree, unflattenTree, sameLayout, scope, tensors, Resource } from 'blaten/backend';
 import * as ast from './adapter.js';
 const diagnostics = new WeakMap<Executable, { readonly dispatchCount: number; readonly workspaceBytes: number }>();
 export function inspect(executable: Executable) {
@@ -38,8 +38,7 @@ function broadcastIndex(index: ast.E, out: Shape, input: Shape): ast.E {
 export class TypeGpuBackend implements Backend {
   readonly name = 'typegpu';
   private destroyed = false;
-  private readonly executables = new Set<Executable>();
-  private readonly tensors = new Set<Tensor<Shape, DType>>();
+  private readonly resources = new Set<Resource>();
 
   private readonly workspace = new Map<string, Buffer[]>();
   private cachedBytes = 0;
@@ -77,14 +76,19 @@ export class TypeGpuBackend implements Backend {
     if (values) this.write(buffer as Buffer, values, dtype);
     return buffer as Buffer;
   }
+  private trackResource(cleanup: () => void): Resource {
+    const resource = new Resource(() => {
+      try { cleanup() } finally { this.resources.delete(resource) }
+    });
+    this.resources.add(resource); return resource;
+  }
   private deviceTensor<S extends Shape, D extends DType>(buffer: Buffer, shape: S, dtype: D): Tensor<S, D> {
-    const result = new Tensor({ owner: this, buffer,
-      read: async () => { this.assertAlive(); return makeStorage(dtype, (await buffer.read() as number[]).slice(0, sizeOf(shape))) },
-      dispose: () => {
-        buffer.destroy(); this.tensors.delete(result);
-      },
+    const resource = this.trackResource(() => buffer.destroy());
+    return new Tensor({ owner: this, buffer,
+      get isDisposed() { return resource.isDisposed },
+      read: async () => { this.assertAlive(); resource.assertAlive(); return makeStorage(dtype, (await buffer.read() as number[]).slice(0, sizeOf(shape))) },
+      dispose: () => resource.dispose(),
     }, shape, dtype);
-    this.tensors.add(result); return result;
   }
   scope = scope;
   copyFrom<S extends Shape, D extends DType>(value: Tensor<S, D>): Promise<Tensor<S, D>>;
@@ -287,7 +291,10 @@ export class TypeGpuBackend implements Backend {
         pipeline.initSync(); steps.push({ pipeline, count });
       }
     } catch (error) { for (const b of buffers.values()) b.destroy(); throw error }
-    let disposed = false;
+    const resource = this.trackResource(() => {
+      for (const [node, buffer] of buffers) this.releaseWorkspace(buffer, node.shape, node.dtype);
+      buffers.clear(); steps.length = 0;
+    });
     const executable: Executable = callable((...arguments_) => {
         let inputs = arguments_;
         if (program.inputLayout) {
@@ -295,7 +302,7 @@ export class TypeGpuBackend implements Backend {
           if (!sameLayout(tree.layout, program.inputLayout)) throw new Error('Input tree does not match signature');
           inputs = tree.leaves;
         }
-        this.assertAlive(); if (disposed) throw new Error('Executable is disposed');
+        this.assertAlive(); resource.assertAlive();
         if (inputs.length !== program.inputs.length) throw new Error('Input count does not match signature');
         // Validate all inputs before recording or writing anything.
         const tensors = inputs.map((value, i) => {
@@ -328,16 +335,17 @@ export class TypeGpuBackend implements Backend {
         });
         this.root.device.queue.submit([encoder.finish()]);
         return program.outputLayout ? unflattenTree(program.outputLayout, results) : program.single ? results[0]! : results;
-      }, () => { if (disposed) return; disposed = true; for (const [node, buffer] of buffers) this.releaseWorkspace(buffer, node.shape, node.dtype); this.executables.delete(executable) });
+      }, resource);
     diagnostics.set(executable, Object.freeze({ dispatchCount: steps.length, workspaceBytes: [...buffers.keys()].reduce((sum, node) => sum + gpuBytes(sizeOf(node.shape), node.dtype), 0) }));
-    this.executables.add(executable); return executable;
+    return executable;
   }
   dispose(): void {
     if (this.destroyed) return;
-    this.executables.forEach(e => e.dispose()); this.tensors.forEach(t => t.dispose());
+    this.destroyed = true;
+    this.resources.forEach(resource => resource.dispose());
     this.directPlans.clear();
     this.workspace.forEach(buffers => buffers.forEach(buffer => buffer.destroy())); this.workspace.clear(); this.cachedBytes = 0;
-    this.root.destroy(); if (this.ownsDevice) this.root.device.destroy(); this.destroyed = true;
+    this.root.destroy(); if (this.ownsDevice) this.root.device.destroy();
   }
 }
 export async function typegpu(options: { device?: GPUDevice } = {}): Promise<TypeGpuBackend> {

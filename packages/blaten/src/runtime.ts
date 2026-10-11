@@ -2,9 +2,10 @@ import type { KernelFunction } from './kernel.js';
 import type { Shape, DType, Scalar } from './types.js';
 import { Tensor } from './tensor.js';
 import { flattenTree, type TensorTree } from './tree.js';
+import { Resource, managed } from './resource.js';
 export type GradientTree<T> = T extends Tensor ? T : T extends readonly unknown[] ? { [K in keyof T]: GradientTree<T[K]> } : T extends object ? { [K in keyof T]: GradientTree<T[K]> } : Tensor<[], 'f32'>;
 export type RuntimeResult<T> = T extends Tensor ? T : T extends number ? Tensor<[], 'f32'> : T extends boolean ? Tensor<[], 'bool'> : T extends bigint ? Tensor<[], 'i64'> : T extends readonly unknown[] ? { [K in keyof T]: RuntimeResult<T[K]> } : T extends object ? { [K in keyof T]: RuntimeResult<T[K]> } : T;
-export interface Executable<T extends KernelFunction = KernelFunction> {
+export interface Executable<T extends KernelFunction = KernelFunction> extends Disposable {
   (...inputs: Parameters<T>): RuntimeResult<ReturnType<T>>;
   dispose(): void;
 }
@@ -23,47 +24,70 @@ export interface Backend {
 export function compile<T extends KernelFunction>(fn: T, backend: Backend, options?: CompileOptions): Promise<Executable<T>> {
   return backend.compile(fn, options);
 }
-export function callable<T extends KernelFunction = KernelFunction>(run: (...inputs: Parameters<T>) => RuntimeResult<ReturnType<T>>, dispose: () => void): Executable<T> {
-  return Object.assign((...inputs: Parameters<T>) => run(...inputs), { dispose });
+export function callable<T extends KernelFunction = KernelFunction>(run: (...inputs: Parameters<T>) => RuntimeResult<ReturnType<T>>, dispose: (() => void) | Resource): Executable<T> {
+  const resource = dispose instanceof Resource ? dispose : new Resource(dispose);
+  return managed((...inputs: Parameters<T>) => {
+    if (resource.isDisposed) throw new Error('Executable is disposed');
+    return run(...inputs);
+  }, resource);
 }
 export const isKernelLeaf = (value: unknown): value is TensorOrScalar => value instanceof Tensor || ['number', 'boolean', 'bigint'].includes(typeof value);
-/** Bounded shape/dtype specialization cache. Failed compilations can be retried. */
+type Entry<T extends KernelFunction> = { plan: Promise<Executable<T>>; users: number; retired: boolean };
+function retire<T extends KernelFunction>(entry: Entry<T>): void {
+  entry.retired = true;
+  if (!entry.users) void entry.plan.then(plan => plan.dispose(), () => {});
+}
+function release<T extends KernelFunction>(entry: Entry<T>): void {
+  if (--entry.users === 0 && entry.retired) void entry.plan.then(plan => plan.dispose(), () => {});
+}
+// A lease retains only its plan, never the lazy function or its specialization cache.
+function lease<T extends KernelFunction>(entry: Entry<T>, plan: Executable<T>): Executable<T> {
+  return callable<T>((...inputs) => plan(...inputs), () => release(entry));
+}
+class LazyCache<T extends KernelFunction> {
+  private readonly cache = new Map<string, Entry<T>>();
+  private disposed = false;
+  constructor(private readonly fn: T, private readonly backend: Backend, private readonly limit: number) {}
+  async prepare(...inputs: Parameters<T>): Promise<Executable<T>> {
+    if (this.disposed) throw new Error('Lazy compiled function is disposed');
+    const { leaves, layout } = flattenTree(inputs, isKernelLeaf);
+    const key = JSON.stringify([layout, leaves.map(value => value instanceof Tensor ? (value.assertAlive(), [value.shape, value.dtype]) : typeof value)]);
+    let entry = this.cache.get(key);
+    if (entry) { this.cache.delete(key); this.cache.set(key, entry) }
+    else {
+      entry = { plan: this.backend.compile(this.fn, { inputs }), users: 0, retired: false };
+      this.cache.set(key, entry);
+    }
+    entry.users++;
+    while (this.cache.size > this.limit) {
+      const oldest = this.cache.keys().next().value!, evicted = this.cache.get(oldest)!;
+      this.cache.delete(oldest); retire(evicted);
+    }
+    try {
+      const plan = await entry.plan;
+      // The acquired lease protects an in-flight compilation even if the
+      // cache is disposed or collected while awaiting it.
+      return lease(entry, plan);
+    } catch (error) {
+      if (this.cache.get(key) === entry) this.cache.delete(key);
+      retire(entry); release(entry); throw error;
+    }
+  }
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.cache.forEach(retire); this.cache.clear();
+  }
+}
+/** Bounded shape/dtype specialization cache. Prepared leases own their lifetime. */
 export function compileLazy<T extends KernelFunction>(fn: T, backend: Backend, options: { cacheSize?: number } = {}) {
   const limit = options.cacheSize ?? 8;
   if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('compileLazy cacheSize must be a positive integer');
-  type Entry = { plan: Promise<Executable<T>>; users: number; retired: boolean };
-  const cache = new Map<string, Entry>();
-  let disposed = false;
-  const retire = (entry: Entry) => {
-    entry.retired = true;
-    if (!entry.users) void entry.plan.then(plan => plan.dispose(), () => {});
-  };
-  const prepare = async (...inputs: Parameters<T>): Promise<Executable<T>> => {
-    if (disposed) throw new Error('Lazy compiled function is disposed');
-    const { leaves, layout } = flattenTree(inputs, isKernelLeaf);
-    const key = JSON.stringify([layout, leaves.map(value => value instanceof Tensor ? (value.assertAlive(), [value.shape, value.dtype]) : typeof value)]);
-    let entry = cache.get(key);
-    if (entry) { cache.delete(key); cache.set(key, entry) }
-    else {
-      entry = { plan: backend.compile(fn, { inputs }), users: 0, retired: false };
-      cache.set(key, entry);
-    }
-    entry.users++;
-    while (cache.size > limit) { const oldest = cache.keys().next().value!; const evicted = cache.get(oldest)!; cache.delete(oldest); retire(evicted) }
-    const release = () => { if (--entry.users === 0 && entry.retired) void entry.plan.then(plan => plan.dispose(), () => {}) };
-    try {
-      const result = await entry.plan;
-      if (disposed) throw new Error('Lazy compiled function is disposed');
-      let released = false;
-      return callable<T>((...inputs) => {
-        if (released || disposed) throw new Error('Prepared executable is disposed');
-        return result(...inputs);
-      }, () => { if (!released) { released = true; release() } });
-    } catch (error) { if (cache.get(key) === entry) cache.delete(key); retire(entry); release(); throw error }
-  };
+  const cache = new LazyCache(fn, backend, limit);
+  const prepare = (...inputs: Parameters<T>) => cache.prepare(...inputs);
   const run = async (...inputs: Parameters<T>) => {
-    const plan = await prepare(...inputs);
-    try { return plan(...inputs) } finally { plan.dispose() }
+    using plan = await prepare(...inputs);
+    return plan(...inputs);
   };
-  return Object.assign(run, { prepare, dispose: () => { if (disposed) return; disposed = true; cache.forEach(retire); cache.clear() } });
+  return managed(Object.assign(run, { prepare }), new Resource(() => cache.dispose()));
 }

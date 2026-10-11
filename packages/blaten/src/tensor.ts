@@ -1,9 +1,11 @@
 import { f32, bool, i64, sizeOf, isDType, isHostStorage, storageDType, makeStorage, promoteTypes, scalarDType, type DType, type Shape, type HostStorage, type Scalar, type ScalarOf } from './types.js';
 import { trackTensor } from './scope.js';
+import { Resource, registerResource, disposeResource } from './resource.js';
 import * as intrinsics from './intrinsics.js';
 import type { Operand, OperandShape, BinaryDType, Broadcast, Floating, Summed, MatmulShape, Transposed, Reduced, Promote } from './tensor-types.js';
 
 export interface DeviceStorage<D extends DType = DType> {
+  readonly isDisposed?: boolean;
   readonly owner: object;
   readonly buffer: unknown;
   read(): Promise<HostStorage<D>>;
@@ -45,7 +47,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
   readonly shape: Readonly<S>;
   readonly strides: readonly number[];
   readonly size: number;
-  private disposed = false;
+  private readonly resource: Resource;
   constructor(storage: HostStorage<D> | DeviceStorage<D>, shape: S, readonly dtype: D = f32 as D) {
     if (!isDType(dtype)) throw new Error(`Unknown dtype ${dtype}`);
     this.size = sizeOf(shape);
@@ -60,14 +62,22 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
     if (isHostStorage(storage) && storageDType(storage) !== (dtype === bool ? 'u8' : dtype)) throw new Error('Storage array does not match tensor dtype');
     if (dtype === bool && isHostStorage(storage) && Array.from(storage as any).some(value => value !== 0 && value !== 1)) throw new Error('bool storage must contain only 0 or 1');
     storages.set(this, storage);
+    this.resource = new Resource(isHostStorage(storage) ? undefined : () => storage.dispose());
+    if (!isHostStorage(storage)) registerResource(this, this.resource);
     trackTensor(this);
   }
   get rank(): S['length'] { return this.shape.length }
-  get isDisposed() { return this.disposed }
-  assertAlive() { if (this.disposed) throw new Error('Tensor is disposed') }
+  get isDisposed() {
+    const storage = storages.get(this);
+    return this.resource.isDisposed || (!!storage && !isHostStorage(storage) && !!storage.isDisposed);
+  }
+  assertAlive() { if (this.isDisposed) throw new Error('Tensor is disposed') }
   async read(): Promise<HostStorage<D>> {
     const storage = storageOf(this);
-    return (isHostStorage(storage) ? storage.slice() : await storage.read()) as HostStorage<D>;
+    const values = isHostStorage(storage) ? storage.slice() : await storage.read();
+    // Keep the Tensor reachable until an asynchronous device read finishes.
+    this.assertAlive();
+    return values as HostStorage<D>;
   }
   async item(): Promise<ScalarOf<D>> {
     if (this.size !== 1) throw new Error('item() requires a one-element tensor');
@@ -97,9 +107,8 @@ export class Tensor<S extends Shape = Shape, D extends DType = DType> {
   sum<const A extends number | readonly number[] | undefined = undefined, K extends boolean = false>(axis?: A, keepDims?: K): Tensor<Reduced<S, A, K>, Summed<D>> { return intrinsics.sum(this, axis, keepDims) as Tensor<Reduced<S, A, K>, Summed<D>> }
   mean<const A extends number | readonly number[] | undefined = undefined, K extends boolean = false>(axis?: A, keepDims?: K): Tensor<Reduced<S, A, K>, Floating<D>> { return intrinsics.mean(this, axis, keepDims) as Tensor<Reduced<S, A, K>, Floating<D>> }
   dispose() {
-    const storage = storages.get(this);
-    if (!this.disposed && storage && !isHostStorage(storage)) storage.dispose();
-    this.disposed = true;
+    disposeResource(this, this.resource);
+    storages.delete(this);
   }
   [Symbol.dispose](): void { this.dispose() }
 }

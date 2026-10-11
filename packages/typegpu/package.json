@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "node tests/run.mjs"
+    "test": "node --expose-gc tests/run.mjs"
   },
   "dependencies": {
     "blaten": "workspace:*",

@@ -16,7 +16,6 @@ function settings(): TrainingOptions {
     epochs: setting('EPOCHS', 3), batchSize: setting('BATCH_SIZE', 64),
     accumulationSteps: setting('ACCUMULATION_STEPS', 1), learningRate: Number(process.env.LEARNING_RATE ?? 0.1),
   };
-  if (setting('HIDDEN', hiddenSize) !== hiddenSize) throw new Error('Change hiddenSize in model.ts to compile other model widths.');
   if (!(options.learningRate > 0) || !Number.isFinite(options.learningRate)) throw new Error('LEARNING_RATE must be a positive finite number');
   if (options.trainSize < options.batchSize) throw new Error('TRAIN_SIZE must be at least BATCH_SIZE');
   return options;

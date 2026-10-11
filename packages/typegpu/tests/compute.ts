@@ -1,8 +1,9 @@
-import { hostData } from 'blaten/backend';
+import { hostData, deviceStorageOf } from 'blaten/backend';
 import { registerKernel } from 'blaten/internal';
 import type { Backend, Signature, Shape } from 'blaten';
 import type { KernelFunction } from 'blaten/backend';
 import assert from 'node:assert/strict';
+import { setImmediate } from 'node:timers/promises';
 import { create, globals } from 'webgpu';
 import { tensor, tensorType, bool, i8, u8, i16, u16, i32, u32, i64, u64, f16, f32, f64, compile, grad, valueAndGrad, customVjp, customJvp, map, sum, mul, add, matmul, relu, crossEntropy, reshape, type Tensor, type DType } from 'blaten';
 import { typegpu, inspect } from '@blaten/typegpu';
@@ -373,6 +374,48 @@ export async function main() {
     assert.equal(await lazyResults[0]!.item(), 5);
     assert.equal(await lazyResults[1]!.item(), 14);
     lazyResults.forEach(value => value.dispose()); lazy.dispose();
+    let ownedSnapshot: Tensor;
+    {
+      using plan = await backend.compile(unresolvedSquares, { inputs: [tensor([1, 2, 3])] });
+      ownedSnapshot = plan(tensor([1, 2, 3], { shape: [3] }));
+    }
+    assert.equal(await ownedSnapshot.item(), 14, 'Outputs survive executable using disposal');
+    ownedSnapshot.dispose();
+    let disposedTensor: Tensor;
+    {
+      using value = await backend.copyFrom(tensor([1, 2, 3]));
+      disposedTensor = value;
+    }
+    assert.ok(disposedTensor.isDisposed);
+
+    // The backend remains live throughout collection, so its resource tracking
+    // and cleanup closures must not keep Tensor or Executable objects alive.
+    const collected = { tensors: 0 };
+    async function abandonTensor() {
+      const value = await backend.copyFrom(tensor([4, 5, 6]));
+      const buffer = deviceStorageOf(value).buffer as { destroy(): void };
+      const destroy = buffer.destroy.bind(buffer);
+      buffer.destroy = () => { collected.tensors++; destroy() };
+      return new WeakRef(value);
+    }
+    const weakTensor = await abandonTensor();
+    const weakPlan = new WeakRef(await backend.compile(unresolvedSquares, { inputs: [tensor([1, 2, 3])] }));
+    for (let attempt = 0; attempt < 200; attempt++) {
+      await setImmediate(); global.gc!(); await setImmediate();
+      if (collected.tensors === 1 && !weakPlan.deref()) break;
+    }
+    assert.equal(weakTensor.deref(), undefined);
+    assert.equal(weakPlan.deref(), undefined);
+    assert.equal(collected.tensors, 1, 'GC destroys an unreachable GPU tensor buffer exactly once');
+
+    const disposableBackend = await typegpu({ device });
+    const liveTensor = await disposableBackend.copyFrom(tensor([1, 2, 3]));
+    const livePlan = await disposableBackend.compile(unresolvedSquares, { inputs: [tensor([1, 2, 3])] });
+    disposableBackend.dispose();
+    assert.ok(liveTensor.isDisposed, 'Backend disposal invalidates live Tensor handles');
+    await assert.rejects(liveTensor.read(), /disposed/);
+    assert.throws(() => livePlan(tensor([1, 2, 3], { shape: [3] })), /disposed/);
+    liveTensor.dispose(); livePlan[Symbol.dispose](); disposableBackend.dispose();
     await backend.synchronize();
     assert.deepEqual(errors, [], 'WebGPU validation must pass');
     console.log(`Passed GPU dtypes: ${backend.capabilities.dtypes.join(', ')}; unsupported f64/i64/u64 and missing shader-f16 are rejected.`);

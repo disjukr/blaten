@@ -17,3 +17,4 @@ export { callable, isKernelLeaf } from './runtime.js';
 export { scope } from './scope.js';
 export { flattenTree, unflattenTree, sameLayout } from './tree.js';
 export { tensors } from './tree.js';
+export { Resource } from './resource.js';
