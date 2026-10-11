@@ -11,7 +11,7 @@ export function hasKernelDirective(node: any): boolean {
 
 // Source AST and TypeScript types are consumed here; the runtime receives plain
 // kernel IR and input signatures, never compiler ASTs or type objects.
-export default function blaten(options: { sourceRoot?: string } = {}): Plugin {
+export default function blaten(options: { sourceRoot?: string; trace?: boolean } = {}): Plugin {
   let sourceRoot = options.sourceRoot ?? process.cwd();
   const sourceFile = (id: string) => {
     const file = id.split('?')[0]!;
@@ -57,7 +57,7 @@ export default function blaten(options: { sourceRoot?: string } = {}): Plugin {
               if (!scope) names.add(reference.node.name);
             } });
             let ir;
-            try { ir = toKernelIR(path.node, names) }
+            try { ir = toKernelIR(path.node, names, options.trace) }
             catch (error) { throw path.buildCodeFrameError((error as Error).message) }
             const metadata = t.objectExpression([
               t.objectProperty(t.identifier('version'), t.numericLiteral(2)),

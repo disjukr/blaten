@@ -8,8 +8,9 @@
     "build": "pnpm -r --filter \"./packages/*\" run build",
     "typecheck": "pnpm -r run typecheck",
     "test": "pnpm -r --filter \"./packages/*\" --if-present run test",
-    "lint": "eslint packages/blaten/src packages/datasets/src packages/compiler/src packages/eslint-plugin/src packages/typegpu/src packages/typegpu/tests examples/mnist/src",
-    "mnist": "pnpm --filter @blaten/mnist start"
+    "lint": "eslint packages/blaten/src packages/datasets/src packages/compiler/src packages/eslint-plugin/src packages/typegpu/src packages/typegpu/tests examples/mnist/src examples/mnist-web/src",
+    "mnist": "pnpm --filter @blaten/mnist start",
+    "mnist:web": "pnpm --filter @blaten/mnist-web dev"
   },
   "devDependencies": {
     "@blaten/eslint-plugin": "workspace:*",

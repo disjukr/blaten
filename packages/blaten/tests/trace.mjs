@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { createTrace, attachSources } from 'blaten/trace';
-import { traceProgram } from 'blaten/backend';
+import { traceProgram, traceKernel, lower } from 'blaten/backend';
+import { registerKernel } from 'blaten/internal';
+import { valueAndGrad } from 'blaten';
 
 const trace = createTrace();
 const first = trace.begin({ name: 'training', backend: 'test', cause: 'explicit' });
@@ -66,4 +68,34 @@ assert.deepEqual(attrs.value, { type: 'bigint', value: '9007199254740993' });
 assert.deepEqual(attrs.data, [{ type: 'bigint', value: '9007199254740993' }]);
 assert.deepEqual(attrs.special.map(v => v.value), ['-0', 'NaN', 'Infinity']);
 assert.deepEqual(JSON.parse(JSON.stringify(trace.toResult())), trace.toResult());
-console.log('Passed: independent compilation records, detached results, payload ownership, and JSON round trips.');
+// Nested calls share their result with the caller, without attributing generated
+// derivative nodes to forward instructions. Repeated calls deduplicate aliases.
+const square = registerKernel(() => {}, { version: 2, name: 'square', externals: {}, ir: {
+  parameterCount: 1, instructions: [{ op: 'argument', index: 0 }, { op: 'binary', operator: 'mul', left: 0, right: 0 }], result: 1,
+} });
+const outer = registerKernel(() => {}, { version: 2, name: 'outer', externals: { square: () => square }, ir: {
+  parameterCount: 1, instructions: [{ op: 'argument', index: 0 }, { op: 'external', name: 'square' }, { op: 'call', target: 1, args: [0] }], result: 2,
+} });
+const signature = { inputs: [{ kind: 'tensor', shape: [], dtype: 'f32' }] };
+assert.equal(lower(outer, signature).origins, undefined, 'Normal lowering does not collect provenance');
+const mapped = createTrace();
+const recorder = mapped.begin({ name: 'origins', backend: 'test', cause: 'explicit' });
+const differentiated = valueAndGrad(outer);
+const kernelIds = traceKernel(recorder, differentiated);
+const program = lower(differentiated, signature, true);
+traceProgram(recorder, program, signature, kernelIds);
+const mappedResult = JSON.parse(JSON.stringify(mapped.toResult()));
+const mappedNodes = mappedResult.compilations[0].artifacts.find(a => a.id === 'tensor-ir').content.value.nodes;
+assert.deepEqual(mappedNodes.find(n => n.op === 'input').origins, [
+  { kernel: kernelIds.get(outer), instruction: 0 }, { kernel: kernelIds.get(square), instruction: 0 },
+]);
+assert.deepEqual(mappedNodes.find(n => n.op === 'mul' && n.inputs.every(id => id === mappedNodes[0].id)).origins, [
+  { kernel: kernelIds.get(square), instruction: 1 }, { kernel: kernelIds.get(outer), instruction: 2 },
+]);
+assert.ok(mappedNodes.some(n => n.op !== 'input' && !n.origins), 'Generated derivatives are not guessed');
+const kernels = mappedResult.compilations[0].artifacts.find(a => a.id === 'kernel-ir').content.value.kernels;
+for (const n of mappedNodes) for (const o of n.origins || []) {
+  assert.ok(kernels.find(k => k.id === o.kernel).ir.instructions[o.instruction]);
+}
+assert.deepEqual(mappedResult, mapped.toResult(), 'Origins survive JSON round trips');
+console.log('Passed: compilation records, payload ownership, JSON round trips, and direct kernel origins.');

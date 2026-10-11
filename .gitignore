@@ -4,3 +4,4 @@ tmp/
 .cache/
 examples/mnist/data/
 examples/mnist/results/*.json
+examples/mnist-web/public/mnist/

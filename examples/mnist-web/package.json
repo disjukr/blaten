@@ -1,0 +1,25 @@
+{
+  "name": "@blaten/mnist-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node prepare-data.mjs && vite --host 127.0.0.1",
+    "build": "node prepare-data.mjs && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@blaten/typegpu": "workspace:*",
+    "@dagrejs/dagre": "^3.1.1",
+    "blaten": "workspace:*",
+    "prismjs": "^1.30.0",
+    "solid-js": "^1.9.9",
+    "typegpu": "~0.12.7"
+  },
+  "devDependencies": {
+    "@blaten/compiler": "workspace:*",
+    "@types/prismjs": "^1.26.6",
+    "vite": "^8.0.0",
+    "vite-plugin-solid": "^2.11.8"
+  }
+}

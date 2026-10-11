@@ -133,10 +133,10 @@ export class TypeGpuBackend implements Backend {
     this.assertAlive();
     const record = this.trace?.begin({ name: traceName(fn), backend: 'typegpu', cause: 'explicit' });
     try {
-      if (record) traceKernel(record, fn);
+      const kernels = record ? traceKernel(record, fn) : undefined;
       const signature = signatureOf(fn, options?.inputs);
-      const program = lower(fn, signature);
-      const ids = record ? traceProgram(record, program, signature) : undefined;
+      const program = lower(fn, signature, !!record);
+      const ids = record ? traceProgram(record, program, signature, kernels) : undefined;
       const executable = this.compileProgram(program, record, ids) as Executable<T>;
       record?.complete();
       return executable;

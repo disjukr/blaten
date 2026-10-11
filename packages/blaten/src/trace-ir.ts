@@ -25,7 +25,7 @@ export function traceName(fn: KernelFunction, seen = new Set<KernelFunction>()):
   const name = traceName(definition.source, seen);
   return definition.kind === 'grad' ? `${definition.value ? 'valueAndGrad' : 'grad'}(${name})` : `${definition.kind}(${name})`;
 }
-export function traceKernel(record: Recorder, fn: KernelFunction): void {
+export function traceKernel(record: Recorder, fn: KernelFunction): Map<KernelFunction, string> {
   const kernels: JsonValue[] = [], ids = new Map<KernelFunction, string>();
   const visit = (current: KernelFunction): string => {
     const found = ids.get(current); if (found) return found;
@@ -49,14 +49,23 @@ export function traceKernel(record: Recorder, fn: KernelFunction): void {
   const entry = visit(fn);
   record.addArtifact({ id: 'kernel-ir', kind: 'blaten.kernel-ir', schemaVersion: 1, content: { type: 'json', value: { entry, kernels } } });
   record.addStage({ id: 'kernel', name: 'Kernel IR', inputs: [], artifacts: ['kernel-ir'] });
+  return ids;
 }
-export function traceProgram(record: Recorder, program: Program, signature?: Signature): Map<import('./ir.js').Node, string> {
+export function traceProgram(record: Recorder, program: Program, signature?: Signature, kernels?: Map<KernelFunction, string>): Map<import('./ir.js').Node, string> {
   const nodes = [...new Set([...program.inputs, ...topological(program.outputs)])];
   const ids = new Map(nodes.map((n, i) => [n, `n${i + 1}`]));
+  const origins = (n: import('./ir.js').Node) => {
+    const references = program.origins?.get(n)?.flatMap(origin => {
+      const kernel = kernels?.get(origin.kernel);
+      return kernel ? [{ kernel, instruction: origin.instruction }] : [];
+    }) || [];
+    const unique = [...new Map(references.map(o => [`${o.kernel}:${o.instruction}`, o])).values()];
+    return unique.length ? { origins: unique } : {};
+  };
   const value = portable({ ...(signature ? { signature } : {}), single: program.single,
     inputs: program.inputs.map(n => ids.get(n)), outputs: program.outputs.map(n => ids.get(n)),
     inputLayout: program.inputLayout, outputLayout: program.outputLayout,
-    nodes: nodes.map(n => ({ id: ids.get(n), op: n.op, shape: n.shape, dtype: n.dtype, inputs: n.inputs.map(x => ids.get(x)), attrs: Object.fromEntries(Object.entries(n.attrs).filter(([key, v]) => key !== 'tensor' && typeof v !== 'function').map(([key, v]) => [key, ids.has(v) ? { node: ids.get(v) } : v])) })) });
+    nodes: nodes.map(n => ({ id: ids.get(n), op: n.op, shape: n.shape, dtype: n.dtype, inputs: n.inputs.map(x => ids.get(x)), ...origins(n), attrs: Object.fromEntries(Object.entries(n.attrs).filter(([key, v]) => key !== 'tensor' && typeof v !== 'function').map(([key, v]) => [key, ids.has(v) ? { node: ids.get(v) } : v])) })) });
   record.addArtifact({ id: 'tensor-ir', kind: 'blaten.tensor-ir', schemaVersion: 1, content: { type: 'json', value } });
   record.addStage({ id: 'tensor', name: 'Tensor IR', inputs: signature ? ['kernel'] : [], artifacts: ['tensor-ir'] });
   return ids;

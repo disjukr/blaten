@@ -11,6 +11,7 @@ packages/
   eslint-plugin/      @blaten/eslint-plugin: kernel syntax and helper validation
 examples/
   mnist/              A 784 -> 32 -> 10 MLP trained on real MNIST data
+  mnist-web/          Solid browser training, weight heatmaps, and compilation traces
 ```
 
 Applications use `blaten` and `@blaten/typegpu`, with `@blaten/compiler` and `@blaten/eslint-plugin` as development dependencies. Babel is a dependency of both tooling packages; the compiler also uses the TypeScript type checker. The core runtime has no production dependencies on Babel, TypeScript, Vite, ESLint, TypeGPU, or tinyest. It consumes kernel IR, specializes shapes, constructs tensor IR, and performs automatic differentiation without retaining source ASTs.
@@ -31,6 +32,11 @@ pnpm typecheck
 pnpm lint
 pnpm mnist
 ```
+
+For the Solid browser example, run `pnpm mnist:web` and open the printed URL
+in a WebGPU-capable Chrome or Edge. It includes live weight heatmaps, learning
+curves, source/IR/WGSL inspection, and dispatch buffer connections. See
+[the browser example](examples/mnist-web/README.md) for static builds and dataset preparation.
 
 The MNIST example uses [@blaten/datasets](packages/datasets/README.md), which provides classification, detection, segmentation, caption, video, optical flow, text, and tabular dataset loaders, with provider downloads or local roots, deterministic shuffling, and tensor batches. MNIST downloads the [CVDF IDX files](https://storage.googleapis.com/cvdf-datasets/mnist/) on first use and caches them in `examples/mnist/data/mnist/`. Defaults are 12,000 training images, 2,000 separate test images, batch size 64, and three epochs. Use `TRAIN_SIZE=60000` and `TEST_SIZE=10000` for the full dataset. `EPOCHS` and `LEARNING_RATE` are also configurable through environment variables. `ACCUMULATION_STEPS` defaults to 1; set it to 4 to average four batches on the GPU before each update. The final accumulation window is flushed at the end of each epoch.
 
@@ -349,8 +355,18 @@ Bigints and nonfinite numbers/negative zero in IR attributes use tagged JSON
 values (`{ type: 'bigint' | 'number', value: string }`).
 
 The compiler records source file references and original character offsets,
-without embedding original source text in kernel metadata. Applications can
-attach selected original files to a detached result with `attachSources()`:
+without embedding original source text in kernel metadata.
+
+For instruction-level source locations, configure the build plugin with
+`blaten({ trace: true })`. This adds `ir.spans`, indexed like `ir.instructions`.
+Each entry is an array of `{ start, end }` ranges into the original full file
+(UTF-16 offsets, end exclusive). Reused arguments, external references, and
+local aliases can have multiple ranges. With tracing omitted or disabled,
+`spans` is absent. This build option records locations only; backend trace
+collection and source attachment remain separate options.
+
+Applications can attach selected original files to a detached result with
+`attachSources()`:
 
 ```ts
 import { attachSources } from 'blaten/trace';

@@ -7,6 +7,42 @@ import { lower, signatureOf, topological } from 'blaten/backend';
 import { compile, tensor, f32, f64, grad, valueAndGrad, tensorType, kernelIr as publicKernelIr } from 'blaten';
 
 const compiler = plugin();
+const spanSource = `// 원문 위치 확인 😀
+function helper(x: number) { return x }
+export function traced(x: number, obj: { value: number }) {
+  'use kernel';
+  const y = helper(x);
+  return [y, y, helper(x), obj.value, obj['value'], -x, true, 3n];
+}`;
+async function spanIR(options) {
+  const result = plugin(options).transform(spanSource, '/project/src/spans.ts');
+  const code = stripTypeScriptTypes(result.code, { mode: 'strip' }).replace(/(['"])(blaten\/internal)\1/g, () => JSON.stringify(import.meta.resolve('blaten/internal')));
+  const exported = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
+  return definitionOf(exported.traced).metadata.ir;
+}
+const untracedIR = await spanIR({});
+assert.equal(Object.hasOwn(untracedIR, 'spans'), false);
+assert.equal(Object.hasOwn(await spanIR({ trace: false }), 'spans'), false);
+const tracedIR = await spanIR({ trace: true });
+const { spans, ...plainIR } = tracedIR;
+assert.deepEqual(plainIR, untracedIR, 'Tracing must not alter instructions or their indices');
+assert.equal(spans.length, tracedIR.instructions.length);
+for (const locations of spans) {
+  assert.ok(locations.length > 0);
+  assert.equal(new Set(locations.map(s => `${s.start}:${s.end}`)).size, locations.length);
+  for (const { start, end } of locations) assert.ok(start >= 0 && end > start && end <= spanSource.length);
+}
+const excerpts = index => spans[index].map(s => spanSource.slice(s.start, s.end));
+assert.equal(excerpts(0).filter(text => text === 'x').length, 3, 'Reused arguments record each occurrence');
+const externalIndex = tracedIR.instructions.findIndex(i => i.op === 'external' && i.name === 'helper');
+assert.deepEqual(excerpts(externalIndex), ['helper', 'helper']);
+const aliasIndex = tracedIR.instructions.findIndex(i => i.op === 'call');
+assert.deepEqual(excerpts(aliasIndex), ['helper(x)', 'y', 'y']);
+const memberIndex = tracedIR.instructions.findIndex(i => i.op === 'member');
+assert.deepEqual(excerpts(memberIndex), ['obj.value']);
+const propertyIndex = tracedIR.instructions.findIndex(i => i.op === 'literal' && i.value === 'value');
+assert.deepEqual(excerpts(propertyIndex), ['value']);
+assert.deepEqual(JSON.parse(JSON.stringify(tracedIR)), tracedIR);
 async function sourceMetadata(options, file, viteRoot) {
   const instance = plugin(options);
   if (viteRoot) instance.configResolved({ root: viteRoot });

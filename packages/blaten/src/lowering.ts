@@ -6,7 +6,9 @@ import * as ir from './ir.js';
 import { shapeOf, dtypeOf, isFloat, type Signature } from './types.js';
 import { flattenTree, unflattenTree, sameLayout, type TreeLayout } from './tree.js';
 
-export interface Program { inputs: ir.Node[]; outputs: ir.Node[]; single: boolean; inputLayout?: TreeLayout; outputLayout?: TreeLayout }
+export interface KernelOrigin { kernel: KernelFunction; instruction: number }
+type Origins = Map<ir.Node, KernelOrigin[]>;
+export interface Program { inputs: ir.Node[]; outputs: ir.Node[]; single: boolean; inputLayout?: TreeLayout; outputLayout?: TreeLayout; origins?: Origins }
 const isExpression = (x: unknown): x is ir.Expression => x instanceof ir.Expression;
 const asNode = (x: any) => toNode(x);
 const isValue = (x: unknown): x is ir.Expression | number | boolean | bigint => isExpression(x) || ['number', 'boolean', 'bigint'].includes(typeof x);
@@ -16,7 +18,8 @@ class IntrinsicMethod {
   constructor(readonly intrinsic: Intrinsic, readonly receiver: ir.Expression) {}
 }
 // Specialize the kernel value graph into shape-resolved tensor IR.
-export function lower(fn: KernelFunction, signature: Signature): Program {
+export function lower(fn: KernelFunction, signature: Signature, trace = false): Program {
+  const origins: Origins | undefined = trace ? new Map() : undefined;
   const inputs: ir.Node[] = [];
   const argument = (type: Signature['inputs'][number]): any => {
     if (typeof type !== 'string' && type.kind === 'tuple') return type.items.map(argument);
@@ -26,7 +29,7 @@ export function lower(fn: KernelFunction, signature: Signature): Program {
   };
   const args = signature.inputs.map(argument);
   const inputLayout = flattenTree(args, isExpression).layout;
-  const value = invoke(fn, args, []);
+  const value = invoke(fn, args, [], origins);
   const result = flattenTree(value, isValue);
   const outputs = result.leaves.map(asNode);
   if (signature.output) {
@@ -35,13 +38,13 @@ export function lower(fn: KernelFunction, signature: Signature): Program {
     const types = flattenTree(expected, (x): x is import('./types.js').ValueType => typeof x === 'string' || !!x && typeof x === 'object' && 'kind' in x && x.kind === 'tensor');
     if (!sameLayout(types.layout, result.layout) || types.leaves.length !== outputs.length || types.leaves.some((type, i) => String(shapeOf(type)) !== String(outputs[i]!.shape) || dtypeOf(type) !== outputs[i]!.dtype)) throw new Error('Output signature does not match inferred shape or dtype');
   }
-  return { inputs, outputs, single: result.layout.kind === 'leaf', inputLayout, outputLayout: result.layout };
+  return { inputs, outputs, single: result.layout.kind === 'leaf', inputLayout, outputLayout: result.layout, ...(origins ? { origins } : {}) };
 }
-function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[]): any {
+function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[], origins?: Origins): any {
   if (stack.includes(fn)) throw new Error('Recursive kernels are not supported');
   const definition = definitionOf(fn);
   if (definition.kind === 'grad') {
-    const output = invoke(definition.source, args, stack);
+    const output = invoke(definition.source, args, stack, origins);
     if ((!isExpression(output) && typeof output === 'object') || asNode(output).shape.length !== 0) throw new Error('grad requires a scalar output; use a reduction');
     const selected = definition.args.map(i => { if (i >= args.length) throw new Error('Gradient argument out of range'); return args[i] });
     const targetTree = flattenTree(selected, isValue);
@@ -53,12 +56,12 @@ function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[]): any {
     return definition.value ? { value: output, grads: result } : result;
   }
   if (definition.kind === 'vjp') {
-    const forward = asNode(invoke(definition.source, args, stack));
+    const forward = asNode(invoke(definition.source, args, stack, origins));
     const tree = flattenTree(args, isValue);
     const n = ir.node('custom', tree.leaves.map(asNode), forward.shape, {
       forward,
       backward: (seed: ir.Node) => {
-        const gradients = invoke(definition.backward, [...args, boxed(seed)], stack);
+        const gradients = invoke(definition.backward, [...args, boxed(seed)], stack, origins);
         const result = flattenTree(gradients, isValue);
         if (!sameLayout(tree.layout, result.layout)) throw new Error('customVjp backward must return an array matching the input trees');
         return result.leaves.map(asNode);
@@ -67,12 +70,12 @@ function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[]): any {
     return boxed(n);
   }
   if (definition.kind === 'jvp') {
-    const forward = asNode(invoke(definition.source, args, stack));
+    const forward = asNode(invoke(definition.source, args, stack, origins));
     // Transpose the linear tangent map using the same reverse-mode IR transform.
     const tree = flattenTree(args, isValue);
     const tangents = tree.leaves.map((a, i) => ir.node('input', [], asNode(a).shape, { tangent: i }, asNode(a).dtype));
     const tangentArgs = unflattenTree(tree.layout, tangents.map(boxed));
-    const tangentOutput = asNode(invoke(definition.jvp, [...args, ...tangentArgs], stack));
+    const tangentOutput = asNode(invoke(definition.jvp, [...args, ...tangentArgs], stack, origins));
     if (String(tangentOutput.shape) !== String(forward.shape)) throw new Error('customJvp output shape must match the forward output');
     assertLinearTangent(tangentOutput, tangents);
     return boxed(ir.node('custom', tree.leaves.map(asNode), forward.shape, {
@@ -140,28 +143,41 @@ function invoke(fn: KernelFunction, args: any[], stack: KernelFunction[]): any {
         const intrinsic = target instanceof IntrinsicMethod ? target.intrinsic : getIntrinsic(target);
         if (target instanceof IntrinsicMethod) callArgs.unshift(target.receiver);
         if (intrinsic?.name === 'map') {
-          return boxed(mapKernel(callArgs[0], asNode(callArgs[1]), nextStack));
+          return boxed(mapKernel(callArgs[0], asNode(callArgs[1]), nextStack, origins));
         }
-        return intrinsic ? intrinsic.fn(...callArgs) : invoke(target, callArgs, nextStack);
+        return intrinsic ? intrinsic.fn(...callArgs) : invoke(target, callArgs, nextStack, origins);
       }
     }
   };
-  for (const instruction of metadata.ir.instructions) values.push(evaluate(instruction));
+  for (const [instruction, operation] of metadata.ir.instructions.entries()) {
+    const value = evaluate(operation);
+    values.push(value);
+    // Record only actual tensor-valued results, including aliases. Internal
+    // intrinsic temporaries and generated gradients have no direct instruction.
+    if (origins && isExpression(value)) {
+      const references = origins.get(value.node) || [];
+      references.push({ kernel: fn, instruction });
+      origins.set(value.node, references);
+    }
+  }
   return values[metadata.ir.result];
 }
 
 /** Apply a scalar kernel with the input dtype preserved during specialization. */
-export function mapKernel(fn: KernelFunction, value: ir.Node, stack: KernelFunction[] = []): ir.Node {
+export function mapKernel(fn: KernelFunction, value: ir.Node, stack: KernelFunction[] = [], origins?: Origins): ir.Node {
   const element = ir.node('input', [], [], { mapElement: true }, value.dtype);
-  const body = asNode(invoke(fn, [boxed(element)], stack));
+  const body = asNode(invoke(fn, [boxed(element)], stack, origins));
   if (body.shape.length) throw new Error('map callback must return a scalar');
+  if (origins?.has(element)) origins.set(value, [...(origins.get(value) || []), ...origins.get(element)!]);
   const replace = new Map<ir.Node, ir.Node>([[element, value]]);
   const clone = (n: ir.Node): ir.Node => {
     const old = replace.get(n); if (old) return old;
     if (!['constant', 'cast', 'and', 'or', 'not', 'add', 'sub', 'mul', 'div', 'neg', 'exp', 'log', 'tanh', 'relu', 'gt', 'eq'].includes(n.op)) throw new Error('map callback must be an elementwise scalar kernel');
     const children = n.inputs.map(clone);
     const shape = children.reduce<readonly number[]>((s, c) => ir.broadcastShape(s, c.shape), []);
-    const result = ir.node(n.op, children, shape, n.attrs, n.dtype); replace.set(n, result); return result;
+    const result = ir.node(n.op, children, shape, n.attrs, n.dtype);
+    if (origins?.has(n)) origins.set(result, [...origins.get(n)!]);
+    replace.set(n, result); return result;
   };
   return ir.broadcast(clone(body), value.shape);
 }

@@ -3,6 +3,8 @@ export interface KernelIR {
   readonly parameterCount: number;
   readonly instructions: readonly KernelInstruction[];
   readonly result: number;
+  /** Original-file UTF-16 offsets, indexed by instruction. Present only for traced builds. */
+  readonly spans?: readonly (readonly { readonly start: number; readonly end: number }[])[];
 }
 /** Value references are zero-based indices into the instruction list. */
 export type KernelInstruction =
