@@ -1,10 +1,12 @@
 import { hostData, deviceStorageOf } from 'blaten/backend';
+import { testTrace } from './trace.js';
 import { registerKernel } from 'blaten/internal';
 import type { Backend, Signature, Shape } from 'blaten';
 import type { KernelFunction } from 'blaten/backend';
 import assert from 'node:assert/strict';
 import { setImmediate } from 'node:timers/promises';
-import { create, globals } from 'webgpu';
+import { create } from 'webgpu';
+import { requestDevice } from '@blaten/typegpu/node';
 import { tensor, tensorType, bool, i8, u8, i16, u16, i32, u32, i64, u64, f16, f32, f64, compile, grad, valueAndGrad, customVjp, customJvp, map, sum, mul, add, matmul, relu, crossEntropy, reshape, type Tensor, type DType } from 'blaten';
 import { typegpu, inspect } from '@blaten/typegpu';
 import { sgd, gradientAccumulator, compileLazy, accumulate, meanMetric, meanAccumulator, multiclassAccuracy } from 'blaten';
@@ -73,14 +75,12 @@ function near(actual: ArrayLike<number>, expected: ArrayLike<number>, tolerance 
   for (let i = 0; i < actual.length; i++) assert.ok(Math.abs(actual[i]! - expected[i]!) < tolerance, `element ${i}: ${actual[i]} != ${expected[i]}`);
 }
 export async function main() {
-  Object.assign(globalThis, globals);
-  const gpu = create([]), adapter = await gpu.requestAdapter();
-  assert.ok(adapter, 'A WebGPU adapter is required for GPU integration tests');
-  const device = await adapter.requestDevice({ requiredFeatures: adapter.features.has('shader-f16') ? ['shader-f16'] : [] });
+  const device = await requestDevice(), gpu = create([]);
   const errors: string[] = [];
   device.addEventListener('uncapturederror', e => errors.push(e.error.message));
   const backend = await typegpu({ device });
   try {
+      await testTrace(device);
     await assert.rejects(compile(squares, backend), /Cannot compile.*shape/);
     await assert.rejects(compile(unresolvedSquares, backend), /Cannot compile.*shape/);
     const concrete = await compile(concreteSquares, backend);

@@ -1,4 +1,5 @@
 // Core facilities shared by backend implementations; no GPU dependencies.
+export { traceKernel, traceProgram, traceName, diagnostic } from './trace-ir.js';
 export { lower } from './lowering.js';
 export type { Program } from './lowering.js';
 export { topological } from './ir.js';

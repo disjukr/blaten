@@ -6,14 +6,31 @@ import type { DType } from 'blaten';
 
 // The only private TypeGPU integration point. Supports TypeGPU ~0.12.7 / tinyest 0.3.4.
 // Application IR stays on blaten's kernel Symbol; only generated compute AST goes here.
-export function pipeline(root: TgpuRoot, name: string, body: Statement[], resources: Record<string, unknown>): TgpuComputePipeline {
+export function pipeline(root: TgpuRoot, name: string, body: Statement[], resources: Record<string, unknown>, onCode?: (code: string) => void): TgpuComputePipeline {
   const stub = (_input: { id: d.v3u }) => { throw new Error('Generated kernels execute only on the GPU') };
   const globals = globalThis as typeof globalThis & { __TYPEGPU_META__?: WeakMap<Function, unknown> };
   const externals = Object.fromEntries(Object.entries({ d, std, ...resources }).map(([key, value]) => [key, () => value]));
   (globals.__TYPEGPU_META__ ??= new WeakMap()).set(stub, {
     v: 2, name, ast: { params: [{ type: 'i', name: 'input' }], body: [0, body] satisfies Block }, externals,
   });
-  return root.createComputePipeline({ compute: tgpu.computeFn({ in: { id: d.builtin.globalInvocationId }, workgroupSize: [64] })(stub).$name(name) });
+  const pipeline = root.createComputePipeline({ compute: tgpu.computeFn({ in: { id: d.builtin.globalInvocationId }, workgroupSize: [64] })(stub).$name(name) });
+  if (onCode) {
+    // TypeGPU 0.12.7 keeps the exact resolved WGSL in this result, but exposes
+    // no public code-generation callback. Observe this pipeline's resolution
+    // inside the pinned adapter; never patch GPUDevice or resolve a second time.
+    const key = Object.getOwnPropertySymbols(pipeline).find(symbol => symbol.description === 'typegpu:0.12.7:$internal');
+    if (!key) throw new Error('Unsupported TypeGPU trace integration: expected 0.12.7 pipeline internals');
+    const core = (pipeline as unknown as Record<symbol, { core: unknown }>)[key]!.core as {
+      resolveAndCreateShaderModule(): { resolutionResult: { code: string } };
+    };
+    const resolve = core.resolveAndCreateShaderModule;
+    core.resolveAndCreateShaderModule = function () {
+      const result = resolve.call(this);
+      onCode(result.resolutionResult.code);
+      return result;
+    };
+  }
+  return pipeline;
 }
 export type E = Expression;
 export type S = Statement;

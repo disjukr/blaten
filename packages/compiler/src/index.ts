@@ -1,6 +1,7 @@
 import { transformSync } from '@babel/core';
 import * as t from '@babel/types';
 import type { Plugin } from 'vite';
+import { posix, win32 } from 'node:path';
 import { toKernelIR } from './kernel-ir.js';
 import { signatureReader } from './signature.js';
 
@@ -10,9 +11,20 @@ export function hasKernelDirective(node: any): boolean {
 
 // Source AST and TypeScript types are consumed here; the runtime receives plain
 // kernel IR and input signatures, never compiler ASTs or type objects.
-export default function blaten(): Plugin {
+export default function blaten(options: { sourceRoot?: string } = {}): Plugin {
+  let sourceRoot = options.sourceRoot ?? process.cwd();
+  const sourceFile = (id: string) => {
+    const file = id.split('?')[0]!;
+    const paths = /^[A-Za-z]:[\\/]|^\\\\/.test(file) ? win32 : posix;
+    if (file.startsWith('\0')) return `virtual/${posix.basename(file.slice(1).replace(/\\/g, '/'))}`;
+    if (!paths.isAbsolute(file)) return file.replace(/\\/g, '/');
+    const name = paths.relative(sourceRoot, file).replace(/\\/g, '/');
+    // Different Windows drives cannot be expressed relative to one another.
+    return paths.isAbsolute(name) ? `external/${paths.basename(file)}` : name;
+  };
   return {
     name: 'blaten:kernel', enforce: 'pre',
+    configResolved(config) { sourceRoot = options.sourceRoot ?? config.root },
     transform(source, id) {
       if (id.includes('node_modules') || !/\.[cm]?[jt]sx?(?:\?|$)/.test(id) || !source.includes('use kernel')) return;
       let count = 0;
@@ -53,6 +65,7 @@ export default function blaten(): Plugin {
               t.objectProperty(t.identifier('ir'), t.valueToNode(ir)),
               ...Object.entries((readSignature ??= signatureReader(source, id))(path.node.start)).map(([key, value]) => t.objectProperty(t.identifier(key), t.valueToNode(value))),
               t.objectProperty(t.identifier('externals'), t.objectExpression([...names].map(name => t.objectProperty(t.identifier(name), t.arrowFunctionExpression([], t.identifier(name)))))),
+              t.objectProperty(t.identifier('source'), t.valueToNode({ file: sourceFile(id), start: path.node.start, end: path.node.end })),
             ]);
             count++;
             if (path.isFunctionDeclaration()) program.getData('registrations').push(t.expressionStatement(t.callExpression(program.getData('register'), [t.identifier(path.node.id.name), metadata])));

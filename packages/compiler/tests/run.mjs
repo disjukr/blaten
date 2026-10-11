@@ -7,6 +7,23 @@ import { lower, signatureOf, topological } from 'blaten/backend';
 import { compile, tensor, f32, f64, grad, valueAndGrad, tensorType, kernelIr as publicKernelIr } from 'blaten';
 
 const compiler = plugin();
+async function sourceMetadata(options, file, viteRoot) {
+  const instance = plugin(options);
+  if (viteRoot) instance.configResolved({ root: viteRoot });
+  const result = instance.transform("export function identity(x: number) { 'use kernel'; return x }", file);
+  const javascript = stripTypeScriptTypes(result.code, { mode: 'strip' }).replace(/(['"])(blaten\/internal)\1/g, () => JSON.stringify(import.meta.resolve('blaten/internal')));
+  const exported = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString('base64')}`);
+  return definitionOf(exported.identity).metadata.source;
+}
+assert.equal((await sourceMetadata({}, '/project/src/model.ts?query', '/project')).file, 'src/model.ts');
+assert.equal((await sourceMetadata({ sourceRoot: '/project' }, '/project/src/model.ts', '/other')).file, 'src/model.ts');
+assert.equal((await sourceMetadata({ sourceRoot: '/project' }, '/shared/model.ts')).file, '../shared/model.ts');
+assert.equal((await sourceMetadata({ sourceRoot: 'C:/project' }, 'C:\\project\\src\\model.ts')).file, 'src/model.ts');
+assert.equal((await sourceMetadata({ sourceRoot: 'C:/project' }, 'D:\\shared\\model.ts')).file, 'external/model.ts');
+assert.equal((await sourceMetadata({ sourceRoot: '/project' }, '\0virtual:/private/model.ts')).file, 'virtual/model.ts');
+const location = await sourceMetadata({ sourceRoot: '/project' }, '/project/src/model.ts');
+assert.deepEqual(location, { file: 'src/model.ts', start: 7, end: "export function identity(x: number) { 'use kernel'; return x }".length });
+assert.equal(Object.hasOwn(location, 'text'), false);
 const source = `
 import { reshape, zeros, tensor, f32, bool, type Tensor as T } from 'blaten';
 import type { Image as ImportedImage } from './fixtures/types.js';
@@ -69,7 +86,7 @@ for (const fn of [module.square, module.shaped, module.alias, module.increment])
   assert.equal(descriptor.configurable, false);
   const { metadata } = definitionOf(fn);
   assert.equal(metadata.version, 2);
-  assert.ok(!('ast' in metadata) && !('source' in metadata), 'Runtime metadata must not carry source AST or source text');
+  assert.ok(!('ast' in metadata) && !('text' in metadata.source), 'Runtime metadata must not carry source AST or source text');
   assert.ok(metadata.ir.instructions.length > 0);
   for (const instruction of metadata.ir.instructions) assert.ok(!('type' in instruction), 'IR instructions must not be Babel nodes');
   assert.deepEqual(JSON.parse(JSON.stringify(metadata.ir)), metadata.ir, 'Kernel IR must be serializable');

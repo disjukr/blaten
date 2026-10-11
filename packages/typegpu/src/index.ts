@@ -3,6 +3,10 @@ import * as d from 'typegpu/data';
 import { Tensor, type TensorTree, type Shape, type DType, type HostStorage, type Scalar } from 'blaten';
 import { lower, signatureOf, topological, sizeOf, isHostStorage, isFloat, makeStorage, type Node, type KernelFunction, type Backend, type Executable, type Program, type CompileOptions, type TensorOrScalar, storageOf, hostData, deviceStorageOf, registerEnvironment, callable, isKernelLeaf, flattenTree, unflattenTree, sameLayout, scope, tensors, Resource } from 'blaten/backend';
 import * as ast from './adapter.js';
+import { createTrace, type Trace, type Recorder, type JsonValue } from 'blaten/trace';
+import { traceKernel, traceProgram, traceName, diagnostic } from 'blaten/backend';
+import { requestDevice } from './device.js';
+export { requestDevice, type DeviceOptions, type DisposableDevice } from './device.js';
 const diagnostics = new WeakMap<Executable, { readonly dispatchCount: number; readonly workspaceBytes: number }>();
 export function inspect(executable: Executable) {
   const result = diagnostics.get(executable);
@@ -43,7 +47,7 @@ export class TypeGpuBackend implements Backend {
   private readonly workspace = new Map<string, Buffer[]>();
   private cachedBytes = 0;
   private readonly directPlans = new Map<string, Executable>();
-  constructor(readonly root: TgpuRoot, private readonly ownsDevice = false) {
+  constructor(readonly root: TgpuRoot, private readonly ownsDevice = false, readonly trace?: Trace) {
     registerEnvironment(this, {
       execute: (program, inputs) => this.executeDirect(program, inputs),
       assign: (target, source) => {
@@ -127,7 +131,16 @@ export class TypeGpuBackend implements Backend {
   }
   async compile<T extends KernelFunction>(fn: T, options?: CompileOptions): Promise<Executable<T>> {
     this.assertAlive();
-    return this.compileProgram(lower(fn, signatureOf(fn, options?.inputs))) as Executable<T>;
+    const record = this.trace?.begin({ name: traceName(fn), backend: 'typegpu', cause: 'explicit' });
+    try {
+      if (record) traceKernel(record, fn);
+      const signature = signatureOf(fn, options?.inputs);
+      const program = lower(fn, signature);
+      const ids = record ? traceProgram(record, program, signature) : undefined;
+      const executable = this.compileProgram(program, record, ids) as Executable<T>;
+      record?.complete();
+      return executable;
+    } catch (error) { record?.fail(diagnostic(error)); throw error }
   }
   async synchronize(): Promise<void> {
     this.assertAlive(); await this.root.device.queue.onSubmittedWorkDone();
@@ -151,7 +164,12 @@ export class TypeGpuBackend implements Backend {
     nodes.forEach(node => { delete node.attrs.tensor });
     let executable = this.directPlans.get(key);
     if (!executable) {
-      executable = this.compileProgram(program);
+      const record = this.trace?.begin({ name: program.outputs.map(n => n.op).join(', '), backend: 'typegpu', cause: 'direct' });
+      try {
+        const ids = record ? traceProgram(record, program) : undefined;
+        executable = this.compileProgram(program, record, ids);
+        record?.complete();
+      } catch (error) { record?.fail(diagnostic(error)); throw error }
       if (this.directPlans.size >= 32) {
         const oldest = this.directPlans.keys().next().value!;
         this.directPlans.get(oldest)!.dispose(); this.directPlans.delete(oldest);
@@ -160,11 +178,16 @@ export class TypeGpuBackend implements Backend {
     this.directPlans.delete(key); this.directPlans.set(key, executable);
     return executable(...inputs);
   }
-  private compileProgram(program: Program): Executable {
+  private compileProgram(program: Program, record?: Recorder, nodeIds?: Map<Node, string>): Executable {
     const order = topological(program.outputs);
     [...program.inputs, ...order].forEach(n => this.assertDType(n.dtype));
     const buffers = new Map<Node, Buffer>();
     const steps: { pipeline: TgpuComputePipeline; count: number }[] = [];
+    const dispatches: JsonValue[] = [];
+    const shaders: string[] = [];
+    if (record) {
+      record.addStage({ id: 'plan', name: 'TypeGPU execution plan', inputs: ['tensor'], artifacts: ['plan'] });
+    }
     const allocate = (n: Node, data?: HostStorage) => { const b = this.acquireWorkspace(n.shape, n.dtype); buffers.set(n, b); if (data) this.write(b, data, n.dtype); return b };
     // Materialize expensive operations and outputs; fuse elementwise/view IR into their consumers.
     const boundaries = new Set(['matmul', 'argmax', 'sum', 'softmax', 'logsoftmax']);
@@ -181,6 +204,7 @@ export class TypeGpuBackend implements Backend {
         const output = allocate(n), resources: Record<string, unknown> = { output: (output as any).as('mutable') };
         const resourceNames = new Map<Node, string>();
         let sequence = 0;
+        const fused = record ? new Set<Node>([n]) : undefined;
         const emit = (node: Node, index: ast.E, statements: ast.S[], memo: Map<string, ast.E>): ast.E => {
           const key = `${node.id}:${JSON.stringify(index)}`;
           const cached = memo.get(key); if (cached) return cached;
@@ -191,6 +215,7 @@ export class TypeGpuBackend implements Backend {
             const value = ast.at(name, index);
             return node.dtype === 'bool' ? ast.binary(value, '!=', ast.uint(0)) : value;
           }
+          fused?.add(node);
           const [a, b] = node.inputs;
           const read = (input: Node) => emit(input, broadcastIndex(index, node.shape, input.shape), statements, memo);
           let expression: ast.E;
@@ -287,10 +312,31 @@ export class TypeGpuBackend implements Backend {
         }
         body.push([11, ast.binary('index', '<', ast.uint(count)), ast.block(work)]);
         if (Math.ceil(count / 64) > this.root.device.limits.maxComputeWorkgroupsPerDimension) throw new Error('Tensor exceeds device dispatch limits');
-        const pipeline = ast.pipeline(this.root, `blaten_${n.op}_${n.id}`, body, resources);
+        const shaderId = `shader-${steps.length + 1}`;
+        const entryPoint = `blaten_${n.op}_${n.id}`;
+        const pipeline = ast.pipeline(this.root, entryPoint, body, resources, record ? code => {
+          record.addArtifact({ id: shaderId, kind: 'source', schemaVersion: 1, content: { type: 'text', language: 'wgsl', value: code } });
+          shaders.push(shaderId);
+        } : undefined);
         pipeline.initSync(); steps.push({ pipeline, count });
+        if (record && nodeIds) {
+          dispatches.push({ id: `d${steps.length}`, output: nodeIds.get(n)!,
+            fusedNodes: [...fused!].map(node => nodeIds.get(node)!), shader: shaderId, entryPoint,
+            workgroupSize: [64, 1, 1], workgroupCount: [Math.ceil(count / 64), 1, 1],
+            resources: [{ name: 'output', node: nodeIds.get(n)!, access: 'read_write' },
+              ...[...resourceNames].map(([node, name]) => ({ name, node: nodeIds.get(node)!, access: 'read' }))] });
+        }
       }
     } catch (error) { for (const b of buffers.values()) b.destroy(); throw error }
+    finally {
+      if (record) {
+        record.addArtifact({ id: 'plan', kind: 'typegpu.execution-plan', schemaVersion: 1, content: { type: 'json', value: {
+          dispatches, dispatchCount: dispatches.length,
+          workspaceBytes: [...buffers.keys()].reduce((sum, node) => sum + gpuBytes(sizeOf(node.shape), node.dtype), 0),
+        } } });
+        record.addStage({ id: 'shaders', name: 'Generated shaders', inputs: ['plan'], artifacts: shaders });
+      }
+    }
     const resource = this.trackResource(() => {
       for (const [node, buffer] of buffers) this.releaseWorkspace(buffer, node.shape, node.dtype);
       buffers.clear(); steps.length = 0;
@@ -347,11 +393,12 @@ export class TypeGpuBackend implements Backend {
     this.workspace.forEach(buffers => buffers.forEach(buffer => buffer.destroy())); this.workspace.clear(); this.cachedBytes = 0;
     this.root.destroy(); if (this.ownsDevice) this.root.device.destroy();
   }
+  [Symbol.dispose](): void { this.dispose() }
 }
-export async function typegpu(options: { device?: GPUDevice } = {}): Promise<TypeGpuBackend> {
-  if (options.device) return new TypeGpuBackend(tgpu.initFromDevice({ device: options.device }));
-  if (!globalThis.navigator?.gpu) throw new Error('WebGPU is unavailable. In Node, provide a device from the webgpu package.');
-  const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) throw new Error('No WebGPU adapter found');
-  return new TypeGpuBackend(tgpu.initFromDevice({ device: await adapter.requestDevice({ requiredFeatures: adapter.features.has('shader-f16') ? ['shader-f16'] : [] }) }), true);
+export async function typegpu(options: { device?: GPUDevice; trace?: boolean | Trace } = {}): Promise<TypeGpuBackend> {
+  const trace = options.trace === true ? createTrace() : options.trace || undefined;
+  if (options.device) return new TypeGpuBackend(tgpu.initFromDevice({ device: options.device }), false, trace);
+  const device = await requestDevice();
+  try { return new TypeGpuBackend(tgpu.initFromDevice({ device }), true, trace) }
+  catch (error) { device.destroy(); throw error }
 }

@@ -7,5 +7,5 @@ const server = await createServer({
   ssr: { external: ['blaten', '@blaten/datasets', '@blaten/typegpu', 'typegpu', 'webgpu'] },
 });
 const runner = createServerModuleRunner(server.environments.ssr, { hmr: false });
-try { await (await runner.import('/src/run.ts')).main() }
+try { await (await runner.import('/src/main.ts')).main() }
 finally { await runner.close(); await server.close() }

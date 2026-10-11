@@ -11,6 +11,7 @@ export interface KernelMetadata {
   signature?: Signature;
   signatureError?: string;
   constraints?: SignatureConstraints;
+  source?: { file: string; start: number; end: number };
 }
 export type Definition =
   | { kind: 'kernel'; metadata: KernelMetadata }

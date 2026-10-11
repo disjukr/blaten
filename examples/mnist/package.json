@@ -9,10 +9,15 @@
   "dependencies": {
     "@blaten/datasets": "workspace:*",
     "@blaten/typegpu": "workspace:*",
+    "@optique/core": "^1.3.4",
+    "@optique/env": "^1.3.4",
+    "@optique/run": "^1.3.4",
     "blaten": "workspace:*",
     "typegpu": "~0.12.7",
     "vite": "^8.0.0",
     "webgpu": "0.6.2"
   },
-  "devDependencies": { "@blaten/compiler": "workspace:*" }
+  "devDependencies": {
+    "@blaten/compiler": "workspace:*"
+  }
 }

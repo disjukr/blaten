@@ -3,11 +3,14 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./node": { "types": "./dist/node.d.ts", "default": "./dist/node.js" }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "node --expose-gc tests/run.mjs"
+    "test": "node tests/device.mjs && node --expose-gc tests/run.mjs"
   },
   "dependencies": {
     "blaten": "workspace:*",
@@ -19,5 +22,6 @@
     "vite": "^8.0.0",
     "webgpu": "0.6.2"
   },
-  "peerDependencies": { "typegpu": "~0.12.7" }
+  "peerDependencies": { "typegpu": "~0.12.7", "webgpu": "0.6.2" },
+  "peerDependenciesMeta": { "webgpu": { "optional": true } }
 }

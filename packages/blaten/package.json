@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./trace": { "types": "./dist/trace.d.ts", "default": "./dist/trace.js" },
     ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
     "./internal": { "types": "./dist/kernel.d.ts", "default": "./dist/kernel.js" },
     "./backend": { "types": "./dist/backend.d.ts", "default": "./dist/backend.js" },
@@ -13,6 +14,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "node tests/dtypes.mjs && node tests/training.mjs && node --expose-gc tests/lifetime.mjs"
+    "test": "node tests/dtypes.mjs && node tests/training.mjs && node --expose-gc tests/lifetime.mjs && node tests/trace.mjs"
   }
 }

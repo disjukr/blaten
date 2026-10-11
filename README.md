@@ -34,7 +34,22 @@ pnpm mnist
 
 The MNIST example uses [@blaten/datasets](packages/datasets/README.md), which provides classification, detection, segmentation, caption, video, optical flow, text, and tabular dataset loaders, with provider downloads or local roots, deterministic shuffling, and tensor batches. MNIST downloads the [CVDF IDX files](https://storage.googleapis.com/cvdf-datasets/mnist/) on first use and caches them in `examples/mnist/data/mnist/`. Defaults are 12,000 training images, 2,000 separate test images, batch size 64, and three epochs. Use `TRAIN_SIZE=60000` and `TEST_SIZE=10000` for the full dataset. `EPOCHS` and `LEARNING_RATE` are also configurable through environment variables. `ACCUMULATION_STEPS` defaults to 1; set it to 4 to average four batches on the GPU before each update. The final accumulation window is flushed at the end of each epoch.
 
-The model's `Images` and `Labels` types leave the batch dimension as `number`. Compilation specializes them from example inputs; set `BATCH_SIZE` to change the batch size without editing model wrappers. `model.ts` sets `hiddenSize = 32`. Results are written to `examples/mnist/results/latest.json`.
+The model's `Images` and `Labels` types leave the batch dimension as `number`. The example uses `compileLazy().prepare()` with zero-filled example inputs to prepare reusable training and inference plans before loading data. Set `BATCH_SIZE` to change the batch size without editing model wrappers. `model.ts` sets `hiddenSize = 32`. Results are written to `examples/mnist/results/latest.json`.
+
+The example uses Optique for CLI and environment parsing. CLI options override
+the existing environment variables, which override defaults. Run
+`pnpm mnist --help` to list options. For example:
+
+```sh
+pnpm mnist --trace --batch-size 128 --learning-rate 0.05
+pnpm mnist --compile-only --batch-size 32
+```
+
+`--train-size`, `--test-size`, `--epochs`, `--batch-size`,
+`--accumulation-steps`, and `--learning-rate` correspond to `TRAIN_SIZE`,
+`TEST_SIZE`, `EPOCHS`, `BATCH_SIZE`, `ACCUMULATION_STEPS`, and `LEARNING_RATE`.
+Counts must be positive safe integers and learning rate must be positive and
+finite. Unknown options and malformed values are rejected before GPU setup.
 
 A verified run improved test accuracy from **12.65% to 88.75%** and epoch-average loss from **0.6756 to 0.2791**. The measurements and environment are recorded in [verification.json](examples/mnist/verification.json). Results depend on configuration and hardware.
 
@@ -75,20 +90,30 @@ gradient.dispose();
 backend.dispose();
 ```
 
-In Node, initialize WebGPU globals and a device first:
+In Node, install `webgpu` and use the Node device utility:
 
 ```ts
-import { create, globals } from 'webgpu';
-Object.assign(globalThis, globals);
-const gpu = create([]);
-const adapter = await gpu.requestAdapter();
-if (!adapter) throw new Error('No WebGPU adapter');
-const device = await adapter.requestDevice();
-const backend = await typegpu({ device });
+import { typegpu } from '@blaten/typegpu';
+import { requestDevice } from '@blaten/typegpu/node';
+
+using device = await requestDevice();
+using backend = await typegpu({ device });
 // ... compile / run ...
-backend.dispose();
-device.destroy(); // The caller owns externally supplied devices.
+await backend.synchronize();
 ```
+
+`requestDevice()` from `@blaten/typegpu` uses browser WebGPU, or a supplied
+`gpu` provider. The Node entry initializes WebGPU globals and a native provider;
+it is separate so browser imports do not load the `webgpu` native module.
+Both utilities accept `adapterOptions` and device descriptor fields such as
+`requiredFeatures`, `requiredLimits`, and `label`. By default, `shader-f16` is
+enabled when supported; supplying `requiredFeatures` overrides that default.
+Device information is available through `device.adapterInfo`. Backend disposal
+releases backend resources; it destroys the device only when the backend
+created it itself. The utilities return the original `GPUDevice` with a
+`Symbol.dispose` method that calls `destroy()`. Declare the device before the
+backend so `using` releases the backend first, then destroys the device, also
+on early returns and exceptions. `using backend` calls `backend.dispose()`.
 
 Calling a kernel directly executes its ordinary JavaScript body. Tensor operations execute in their inputs' environment: host tensors use the CPU reference implementation, while GPU tensors submit GPU operations. Direct calls execute operation by operation; `compile()` uses kernel IR to fuse operations across the function. Mixing host and device tensors, or tensors belonging to different backends, requires an explicit `await destination.copyFrom(source)` first. JS scalars can be used with tensors in either environment.
 
@@ -168,7 +193,7 @@ const optimizer = sgd(parameters, { learningRate: 0.1 });
 optimizer.step(gradients);
 ```
 
-Parameters and gradients must have matching tree structure, environment, shapes, and floating dtypes. Record key insertion order does not matter. Parameter tensors must be distinct. Updates mutate parameter storage without reading GPU gradients on the CPU. The MNIST example normalizes data and prepares batches on the CPU, performs forward/backward computation and parameter updates on the GPU, and accumulates scalar loss on the GPU. Training batches submit work without a host read; epoch reporting reads average loss once. Evaluation accumulates multiclass accuracy on the GPU, excludes padded rows, and reads one scalar at the evaluation boundary. The example's `src/train.ts` contains training and evaluation; `src/run.ts` handles execution settings, dataset loading, result metadata, saving, and learning verification.
+Parameters and gradients must have matching tree structure, environment, shapes, and floating dtypes. Record key insertion order does not matter. Parameter tensors must be distinct. Updates mutate parameter storage without reading GPU gradients on the CPU. The MNIST example normalizes data and prepares batches on the CPU, performs forward/backward computation and parameter updates on the GPU, and accumulates scalar loss on the GPU. Training batches submit work without a host read; epoch reporting reads average loss once. Evaluation accumulates multiclass accuracy on the GPU, excludes padded rows, and reads one scalar at the evaluation boundary. The example's `src/main.ts` contains CLI settings, dataset loading, compilation preparation, training and evaluation, trace/result saving, and learning verification.
 
 ## Training and tensor lifetimes
 
@@ -275,6 +300,109 @@ const specialized = await compile(genericSum, backend, {
 A compiled program accepts only its specialized shapes and dtypes. Compile another program for another shape; automatic recompilation and a single program with dynamic shapes are not implemented.
 
 ## IR and backend boundaries
+
+### Compilation traces
+
+Enable an opt-in trace on the backend to collect compilation artifacts without
+changing compile calls. Tracing does not run kernels or download training data.
+
+```ts
+const backend = await typegpu({ device, trace: true });
+const executable = await backend.compile(fn, { inputs });
+const result = backend.trace!.toResult();
+const json = JSON.stringify(result, null, 2);
+```
+
+`createTrace()` from `blaten/trace` can also create a trace to pass explicitly,
+including when sharing a collector across backends. `Trace` has `begin(info)`
+for backend writers and `toResult()` for applications.
+`begin()` returns a recorder for one compilation, with `addStage()`,
+`addArtifact()`, `complete()`, and `fail()`. Stage and artifact IDs are local to
+that compilation. Recorders are independent, so overlapping compilations do not
+mix artifacts. `toResult()` returns a detached copy; later recording and changes
+to the returned object do not affect one another. It does not stop recording.
+
+`TraceResult` contains `format: 'blaten-trace'`, `version: 1`, and a list of
+compilations. Each compilation contains its backend, cause (`explicit` for
+compile calls, `direct` for new eager-operation plans), status, stages,
+artifacts, and diagnostics. Lazy compilation records each new specialization
+through the same compile path; cache hits do not add records. Pending and failed
+compilations are included, along with artifacts available before failure.
+
+Artifacts have a namespaced `kind`, `schemaVersion`, and JSON, text, or base64
+binary content. The common format does not require GPU dispatches or WGSL.
+TypeGPU currently supplies:
+
+- `blaten.kernel-ir`: the entry definition, derivative/custom differentiation
+  relationships, source kernels, and references to other registered kernels.
+- `blaten.tensor-ir`: the concrete signature, input/output tree layouts, and
+  nodes with compilation-local IDs, operations, shapes, dtypes, and input edges.
+- `typegpu.execution-plan`: dispatch order, output and fused node IDs, resource
+  roles, workgroup sizes/counts, workspace bytes, and shader artifact references.
+- `source`: the exact WGSL used to create each dispatch's shader module.
+
+Resource roles are backend logical names, not WGSL binding numbers. The WGSL
+contains the actual binding declarations. Traces do not retain executables,
+Tensor objects, or GPU resources. Runtime inputs and learned weights are not
+included. Captured constants needed to describe the program can appear in IR.
+Bigints and nonfinite numbers/negative zero in IR attributes use tagged JSON
+values (`{ type: 'bigint' | 'number', value: string }`).
+
+The compiler records source file references and original character offsets,
+without embedding original source text in kernel metadata. Applications can
+attach selected original files to a detached result with `attachSources()`:
+
+```ts
+import { attachSources } from 'blaten/trace';
+import modelSource from './model.ts?raw'; // Vite browser application
+
+const result = backend.trace!.toResult();
+attachSources(result, { 'src/model.ts': modelSource });
+// A viewer receives only result; no runtime or file access is needed.
+```
+
+Keys match the file references recorded by the compiler. Values are full,
+unmodified source files from the same build, not kernel excerpts or generated
+JavaScript. `attachSources()` mutates only the supplied result, stores each full
+file once in `result.sources`, and links its artifact ID from Kernel IR and each
+compilation's `TypeScript source` stage. Kernel `start`/`end` offsets refer to
+that full file; viewers can highlight the range while showing surrounding code.
+Missing files remain unresolved. Repeated calls update existing files without
+duplicating artifacts, including files shared across compilations. Applications decide
+which source files to expose; the compiler has no `includeSource` option.
+Source file names default to forward-slash paths relative to Vite's project
+root (or the current working directory when using the plugin directly).
+Set `sourceRoot` to choose another base, for example
+`blaten({ sourceRoot: repositoryRoot })`. Files outside the
+root use `../` paths; files on a different Windows drive use `external/<name>`,
+and virtual modules use `virtual/<name>`. The original absolute source path is
+not retained in kernel metadata. This does not rewrite error stack traces or
+the bundler's source maps.
+Trace collection is independent of source attachment, and there is no
+source-to-tensor-node provenance mapping yet.
+TypeGPU's pinned adapter observes pipeline resolution to capture WGSL without
+patching the device or generating a second copy of the shader.
+
+The result can be saved as ordinary JSON and read with `JSON.parse()`. No
+validator, schema library, file I/O API, or viewer is included. Restoring JSON
+restores inspection data, not an executable. The envelope and artifact schemas
+are versioned separately; backend artifact formats are experimental.
+
+For a compilation-only MNIST example:
+
+```sh
+pnpm build
+pnpm --filter @blaten/mnist start --compile-only
+```
+
+This uses the same `compileLazy().prepare()` calls as training to compile
+`valueAndGrad(loss)` and `predict`, then saves `examples/mnist/results/trace.json`
+without loading data or executing either kernel. Batch size defaults to 64 and
+can be set through `BATCH_SIZE`. `--inspect` remains an alias for `--compile-only`.
+Pass `--trace` instead to train and collect all new compilations, including
+optimizer and metric plans. Both modes explicitly read `src/model.ts` and
+attach its source excerpts before saving the result; no separate inspection
+entry point is needed.
 
 ```text
 TypeScript + 'use kernel'
