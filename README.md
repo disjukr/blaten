@@ -5,6 +5,7 @@ An experimental TypeScript tensor library with kernel compilation and automatic 
 ```text
 packages/
   blaten/             Tensors, IR, automatic differentiation, backend interfaces
+  datasets/           @blaten/datasets: dataset downloads, caching, and tensor batches
   typegpu/            @blaten/typegpu: GPU code generation and execution
   compiler/           @blaten/compiler: AST-to-kernel-IR build plugin
   eslint-plugin/      @blaten/eslint-plugin: kernel syntax and helper validation
@@ -31,7 +32,7 @@ pnpm lint
 pnpm mnist
 ```
 
-MNIST downloads the [CVDF IDX files](https://storage.googleapis.com/cvdf-datasets/mnist/) on first use and caches them in `examples/mnist/data/`. Defaults are 12,000 training images, 2,000 separate test images, batch size 64, and three epochs. Use `TRAIN_SIZE=60000` and `TEST_SIZE=10000` for the full dataset. `EPOCHS` and `LEARNING_RATE` are also configurable through environment variables. `ACCUMULATION_STEPS` defaults to 1; set it to 4 to average four batches on the GPU before each update. The final accumulation window is flushed at the end of each epoch.
+The MNIST example uses [@blaten/datasets](packages/datasets/README.md), which provides classification, detection, segmentation, caption, video, optical flow, text, and tabular dataset loaders, with provider downloads or local roots, deterministic shuffling, and tensor batches. MNIST downloads the [CVDF IDX files](https://storage.googleapis.com/cvdf-datasets/mnist/) on first use and caches them in `examples/mnist/data/mnist/`. Defaults are 12,000 training images, 2,000 separate test images, batch size 64, and three epochs. Use `TRAIN_SIZE=60000` and `TEST_SIZE=10000` for the full dataset. `EPOCHS` and `LEARNING_RATE` are also configurable through environment variables. `ACCUMULATION_STEPS` defaults to 1; set it to 4 to average four batches on the GPU before each update. The final accumulation window is flushed at the end of each epoch.
 
 The model's `Images` and `Labels` types leave the batch dimension as `number`. Compilation specializes them from example inputs; set `BATCH_SIZE` to change the batch size without editing model wrappers. `model.ts` sets `hiddenSize = 32`. Results are written to `examples/mnist/results/latest.json`.
 
@@ -184,9 +185,10 @@ const training = await backend.compile(valueAndGrad(loss), { inputs: [parameters
 using optimizer = accumulate(sgd(parameters, { learningRate: 0.1 }), { steps: 4 });
 using lossMetric = meanMetric();
 
-for (const batch of epochBatches) {
+for await (const batch of epochBatches) {
+  using ownedBatch = batch;
   backend.scope(() => {
-    const [x, y] = batch.toTensors();
+    const { images: x, targets: y } = batch.data;
     const { value, grads } = training(parameters, x, y);
     optimizer.step(grads, { weight: batch.size });
     lossMetric.add(value, { weight: batch.size });
@@ -196,7 +198,7 @@ optimizer.flush();
 const lossValue = await backend.scope(() => lossMetric.compute().item());
 ```
 
-`scope()` tracks tensors created synchronously inside its callback, including CPU batch tensors and GPU operation results. It releases temporaries on normal return or exception. Returned tensors, including tensors inside arrays or records, escape to the caller (or an enclosing scope); borrowed input tensors are untouched. A synchronous callback can return a read Promise: cleanup waits for it to settle, including rejection. Async callbacks are rejected; allocations after an `await` or inside a Promise continuation are not part of the scope. This keeps allocation ownership local without a Node-specific async context. `scope()` is also exported directly by `blaten`, and `disposeTree()` releases an explicitly owned tensor tree.
+`scope()` tracks tensors created synchronously inside its callback, including GPU operation results. Dataset batch tensors are allocated before the callback and released by the batch's `using` declaration. Scope releases temporaries on normal return or exception. Returned tensors, including tensors inside arrays or records, escape to the caller (or an enclosing scope); borrowed input tensors are untouched. A synchronous callback can return a read Promise: cleanup waits for it to settle, including rejection. Async callbacks are rejected; allocations after an `await` or inside a Promise continuation are not part of the scope. This keeps allocation ownership local without a Node-specific async context. `scope()` is also exported directly by `blaten`, and `disposeTree()` releases an explicitly owned tensor tree.
 
 `accumulate(optimizer, { steps })` wraps any `Optimizer<P>` exposing its bound `parameters` and `step(gradients)`. It borrows that optimizer and its parameters and owns the accumulation buffers. `step(grads, { weight })` averages gradients using positive finite weights and applies the wrapped optimizer every `steps` calls. `steps: 1` applies gradients directly. `flush()` applies a final partial window and is a no-op when empty. Disposal discards pending gradients; it does not apply updates or dispose the wrapped optimizer or parameters.
 
@@ -209,7 +211,7 @@ const lossValue = await backend.scope(() => lossMetric.compute().item());
 ```ts
 using accuracy = multiclassAccuracy();
 backend.scope(() => {
-  const [x, y] = batch.toTensors();
+  const { images: x, targets: y } = batch.data;
   accuracy.add({ logits: inference(parameters, x), targets: y, validCount: batch.size });
 });
 const score = await backend.scope(() => accuracy.compute().item());

@@ -7,6 +7,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@blaten/datasets": "workspace:*",
     "@blaten/typegpu": "workspace:*",
     "blaten": "workspace:*",
     "typegpu": "~0.12.7",

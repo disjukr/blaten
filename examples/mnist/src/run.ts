@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { hiddenSize } from './model.js';
-import { load } from './data.js';
+import { mnist } from '@blaten/datasets';
 import { train, type TrainingOptions } from './train.js';
 import { withBackend } from './runtime.js';
 
@@ -22,11 +22,15 @@ function settings(): TrainingOptions {
 }
 export async function main() {
   const options = settings(), started = performance.now();
-  const [trainData, testData] = await Promise.all([load('train'), load('test')]);
-  if (options.trainSize > trainData.count || options.testSize > testData.count) throw new Error('Requested subset exceeds MNIST size');
+  const [trainData, testData] = await Promise.all([
+    mnist({ split: 'train', root: 'data/mnist' }),
+    mnist({ split: 'test', root: 'data/mnist' }),
+  ]);
+  const data = { train: trainData, test: testData };
+  if (options.trainSize > data.train.count || options.testSize > data.test.count) throw new Error('Requested subset exceeds MNIST size');
   const result = await withBackend(async (backend, adapter) => {
     console.log(`Device: ${adapter.info.description || adapter.info.device || 'WebGPU'}`);
-    const learning = await train(backend, { train: trainData, test: testData }, options);
+    const learning = await train(backend, data, options);
     return {
       verifiedAt: new Date().toISOString(), dataset: 'MNIST (CVDF IDX)', backend: 'typegpu', typegpuVersion: createRequire(import.meta.url)('typegpu/package.json').version,
       node: process.version, platform: process.platform, architecture: process.arch,

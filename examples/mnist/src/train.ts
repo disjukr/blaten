@@ -1,29 +1,34 @@
 import { sgd, valueAndGrad, accumulate, meanMetric, multiclassAccuracy, type Executable } from 'blaten';
 import { inspect, type TypeGpuBackend } from '@blaten/typegpu';
 import { hiddenSize, initParameters, loss, predict, type Parameters } from './model.js';
-import { batches, type Dataset } from './data.js';
+import { dataLoader, imageClassification, type ImageDataset } from '@blaten/datasets';
 
 export interface TrainingOptions {
   trainSize: number; testSize: number; epochs: number; batchSize: number;
   accumulationSteps: number; learningRate: number;
 }
+interface TrainingData { train: ImageDataset<784, 10>; test: ImageDataset<784, 10> }
+const collate = imageClassification({ layout: 'flat', labels: 'oneHot' });
 
-async function evaluate(backend: TypeGpuBackend, inference: Executable<typeof predict>, parameters: Parameters, data: Dataset, size: number, batchSize: number) {
+async function evaluate(backend: TypeGpuBackend, inference: Executable<typeof predict>, parameters: Parameters, data: ImageDataset<784, 10>, size: number, batchSize: number) {
   using accuracy = multiclassAccuracy();
-  for (const batch of batches(data, { size, batchSize })) {
+  for await (const batch of dataLoader({ dataset: data, size, batchSize, lastBatch: 'pad', collate })) {
+    using ownedBatch = batch;
     backend.scope(() => {
-      const [x, y] = batch.toTensors();
+      const { images: x, targets: y } = batch.data;
       accuracy.add({ logits: inference(parameters, x), targets: y, validCount: batch.size });
     });
   }
   return backend.scope(() => accuracy.compute().item());
 }
-export async function train(backend: TypeGpuBackend, data: { train: Dataset; test: Dataset }, options: TrainingOptions) {
+export async function train(backend: TypeGpuBackend, data: TrainingData, options: TrainingOptions) {
   const { trainSize, testSize, epochs, batchSize, accumulationSteps, learningRate } = options;
   const { train: trainData, test: testData } = data;
   const parameters = await backend.scope(() => backend.copyFrom(initParameters()));
+  const examples = dataLoader({ dataset: trainData, size: batchSize, batchSize, collate });
+  using example = (await examples.first())!;
   const [training, inference] = await backend.scope(() => {
-    const [x, y] = batches(trainData, { size: batchSize, batchSize }).next().value!.toTensors();
+    const { images: x, targets: y } = example.data;
     return Promise.all([
       backend.compile(valueAndGrad(loss), { inputs: [parameters, x, y] }),
       backend.compile(predict, { inputs: [parameters, x] }),
@@ -37,9 +42,10 @@ export async function train(backend: TypeGpuBackend, data: { train: Dataset; tes
   console.log(`Before training: ${(initialAccuracy * 100).toFixed(2)}% test accuracy`);
   for (let epoch = 1; epoch <= epochs; epoch++) {
     lossMetric.reset();
-    for (const batch of batches(trainData, { size: trainSize, batchSize, shuffleSeed: 100 + epoch, dropLast: true })) {
+    for await (const batch of dataLoader({ dataset: trainData, size: trainSize, batchSize, shuffleSeed: 100 + epoch, lastBatch: 'drop', collate })) {
+      using ownedBatch = batch;
       backend.scope(() => {
-        const [x, y] = batch.toTensors(), { value, grads } = training(parameters, x, y);
+        const { images: x, targets: y } = batch.data, { value, grads } = training(parameters, x, y);
         optimizer.step(grads, { weight: batch.size });
         lossMetric.add(value, { weight: batch.size });
       });
