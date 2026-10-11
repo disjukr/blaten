@@ -30,6 +30,6 @@ try {
   await assert.rejects(downloadFile(root, { url: 'https://provider.invalid/missing' }, false), /missing/); assert.equal(requests, 1);
   await writeFile(join(root, 'good.zip'), zip('data/z.txt', 'zip')); await extractArchive(join(root, 'good.zip'), join(root, 'zip')); assert.equal(await readFile(join(root, 'zip/data/z.txt'), 'utf8'), 'zip');
   await writeFile(join(root, 'bad.zip'), zip('../outside.txt', 'bad')); await assert.rejects(extractArchive(join(root, 'bad.zip'), join(root, 'zip')), /Invalid dataset path/);
-  await mkdir(join(root, 'outside')); await symlink(join(root, 'outside'), join(root, 'zip/link')); await writeFile(join(root, 'link.zip'), zip('link/escape.txt', 'bad')); await assert.rejects(extractArchive(join(root, 'link.zip'), join(root, 'zip')), /symlink/); assert.deepEqual(await readdir(join(root, 'outside')), []);
+  await mkdir(join(root, 'outside')); await symlink(join(root, 'outside'), join(root, 'zip/link'), process.platform === 'win32' ? 'junction' : 'dir'); await writeFile(join(root, 'link.zip'), zip('link/escape.txt', 'bad')); await assert.rejects(extractArchive(join(root, 'link.zip'), join(root, 'zip')), /symlink/); assert.deepEqual(await readdir(join(root, 'outside')), []);
   console.log('Passed: streamed downloads, offline archives, shared extraction, interrupted extraction recovery, ZIP/TAR decoding, and archive path checks.');
 } finally { globalThis.fetch = originalFetch; await rm(root, { recursive: true, force: true }) }

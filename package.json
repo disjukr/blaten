@@ -5,9 +5,9 @@
   "packageManager": "pnpm@12.10.1",
   "engines": { "node": ">=22.12.0", "pnpm": ">=10" },
   "scripts": {
-    "build": "pnpm -r --filter './packages/*' run build",
+    "build": "pnpm -r --filter \"./packages/*\" run build",
     "typecheck": "pnpm -r run typecheck",
-    "test": "pnpm -r --filter './packages/*' --if-present run test",
+    "test": "pnpm -r --filter \"./packages/*\" --if-present run test",
     "lint": "eslint packages/blaten/src packages/datasets/src packages/compiler/src packages/eslint-plugin/src packages/typegpu/src packages/typegpu/tests examples/mnist/src",
     "mnist": "pnpm --filter @blaten/mnist start"
   },
